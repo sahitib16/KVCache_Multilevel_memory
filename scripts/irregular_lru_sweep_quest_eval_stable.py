@@ -29,7 +29,7 @@ D = 64
 page_size = 16
 
 num_pages_total = 4096
-hbm_capacity = 64
+hbm_capacity = 16
 
 T = 200
 W = 32

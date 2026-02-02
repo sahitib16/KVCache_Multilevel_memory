@@ -2,11 +2,14 @@ import time, random, csv
 import torch
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 
+from quest_selector import compute_page_minmax
+from select_pages import select_topk_pages
+
 torch.manual_seed(0)
 random.seed(0)
 torch.set_grad_enabled(False)
 
-device = "cuda" 
+device = "cuda"
 dtype = torch.float16
 
 B = 1
@@ -17,21 +20,21 @@ page_size = 16
 
 num_pages_total = 4096
 hbm_capacity = 64
-
 T = 200
 W = 32
-num_sparse = 8
+topk = 8
 
-# Query
+# Choose implementation: "minimal_quest" now; later "quest_repo"
+QUEST_IMPL = "minimal_quest"
+
 q = torch.randn((B, Hq, D), device=device, dtype=dtype)
 
-# CPU pinned KV store
-k_cpu = torch.randn((num_pages_total, page_size, Hkv, D),
-                    device="cpu", dtype=dtype, pin_memory=True)
-v_cpu = torch.randn((num_pages_total, page_size, Hkv, D),
-                    device="cpu", dtype=dtype, pin_memory=True)
+k_cpu = torch.randn((num_pages_total, page_size, Hkv, D), device="cpu", dtype=dtype, pin_memory=True)
+v_cpu = torch.randn((num_pages_total, page_size, Hkv, D), device="cpu", dtype=dtype, pin_memory=True)
 
-# GPU cache
+# Precompute page metadata once (QUEST-style)
+k_min, k_max = compute_page_minmax(k_cpu)
+
 k_hbm = torch.empty((hbm_capacity, page_size, Hkv, D), device="cuda", dtype=dtype)
 v_hbm = torch.empty((hbm_capacity, page_size, Hkv, D), device="cuda", dtype=dtype)
 
@@ -40,17 +43,11 @@ page_to_slot = {}
 
 last_used_step = {}
 current_step = 0
-
-# Counters for evictions
 evictions_this_step = 0
 
 def make_wrapper():
     workspace = torch.empty((256 * 1024 * 1024 // 4,), device="cuda", dtype=torch.float32)
-    return BatchDecodeWithPagedKVCacheWrapper(
-        float_workspace_buffer=workspace,
-        kv_layout="NHD",
-        backend="auto",
-    )
+    return BatchDecodeWithPagedKVCacheWrapper(float_workspace_buffer=workspace, kv_layout="NHD", backend="auto")
 
 def reset_state():
     global page_to_slot, last_used_step, current_step
@@ -60,11 +57,9 @@ def reset_state():
     current_step = 0
 
 def choose_victim_slot():
-    # Empty slot?
     for slot in range(hbm_capacity):
         if int(slot_to_page[slot]) == -1:
             return slot
-    # LRU
     victim_slot = 0
     victim_time = None
     for slot in range(hbm_capacity):
@@ -116,21 +111,19 @@ def build_page_table(needed_pages):
     return indptr, indices, last_page_len, misses, transfer_ms
 
 def run_decode(wrapper, indptr, indices, last_page_len):
-    wrapper.begin_forward(
-        indptr, indices, last_page_len,
-        num_qo_heads=Hq,
-        num_kv_heads=Hkv,
-        head_dim=D,
-        page_size=page_size,
-    )
+    wrapper.begin_forward(indptr, indices, last_page_len,
+                          num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size)
     _ = wrapper.forward(q, (k_hbm, v_hbm))
     torch.cuda.synchronize()
     wrapper.end_forward()
 
 def gen_needed_pages(t):
     local_pages = list(range(t, t + W))
-    sparse_pages = random.sample(range(0, num_pages_total), num_sparse)
-    sparse_pages = [p for p in sparse_pages if p < t or p >= t + W]
+
+    # QUEST selection happens on CPU; use q[0] head moved to CPU
+    topk_ids = select_topk_pages(q[0].to("cpu"), k_min, k_max, topk=topk, impl=QUEST_IMPL).tolist()
+    sparse_pages = [p for p in topk_ids if (p < t or p >= t + W)]
+
     return local_pages, sparse_pages, local_pages + sparse_pages
 
 def run_with_prefetch(prefetch_k, csv_path):
@@ -140,14 +133,14 @@ def run_with_prefetch(prefetch_k, csv_path):
     reset_state()
 
     fieldnames = [
-        "t", "prefetch_k", "needed_local", "needed_sparse",
-        "evictions", "ondemand_misses", "ondemand_transfer_ms",
-        "prefetch_misses", "prefetch_transfer_ms"
+        "t","prefetch_k","needed_local","needed_sparse",
+        "evictions","ondemand_misses","ondemand_transfer_ms",
+        "prefetch_misses","prefetch_transfer_ms"
     ]
 
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
 
         for t in range(T):
             current_step = t
@@ -155,7 +148,7 @@ def run_with_prefetch(prefetch_k, csv_path):
 
             local_pages, sparse_pages, needed = gen_needed_pages(t)
 
-            # Prefetch phase
+            # Prefetch phase (baseline: sequential)
             prefetch_misses = 0
             prefetch_transfer = 0.0
             if prefetch_k > 0:
@@ -167,10 +160,9 @@ def run_with_prefetch(prefetch_k, csv_path):
 
             # On-demand phase
             indptr, indices, last_page_len, ond_miss, ond_ms = build_page_table(needed)
-
             run_decode(wrapper, indptr, indices, last_page_len)
 
-            w.writerow({
+            writer.writerow({
                 "t": t,
                 "prefetch_k": prefetch_k,
                 "needed_local": len(local_pages),
@@ -183,12 +175,10 @@ def run_with_prefetch(prefetch_k, csv_path):
             })
 
 def main():
-    # Change this value to log different runs
-    prefetch_k = 16
-    out = f"results/step_log_prefetch{prefetch_k}.csv"
-    print(f"[run] prefetch_k={prefetch_k} -> {out}")
-    run_with_prefetch(prefetch_k, out)
-    print("[done] wrote", out)
+    for k in [0,4,8,16]:
+        out = f"results/quest_step_log_prefetch{k}.csv"
+        print(f"[run] QUEST impl={QUEST_IMPL} prefetch_k={k} -> {out}")
+        run_with_prefetch(k, out)
 
 if __name__ == "__main__":
     main()

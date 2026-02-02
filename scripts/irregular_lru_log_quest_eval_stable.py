@@ -1,4 +1,4 @@
-import time, random, csv
+import os, sys, time, random, csv
 import torch
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 
@@ -6,7 +6,20 @@ torch.manual_seed(0)
 random.seed(0)
 torch.set_grad_enabled(False)
 
-device = "cuda" 
+# ----------------------------
+# Import QUEST repo eval selector
+# ----------------------------
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+QUEST_ROOT = os.path.join(REPO_ROOT, "external", "Quest")
+if QUEST_ROOT not in sys.path:
+    sys.path.insert(0, QUEST_ROOT)
+
+from evaluation.quest_attention import local_heavy_hitter_mask
+
+# ----------------------------
+# Configuration
+# ----------------------------
+device = "cuda"
 dtype = torch.float16
 
 B = 1
@@ -16,20 +29,24 @@ D = 64
 page_size = 16
 
 num_pages_total = 4096
-hbm_capacity = 64
+hbm_capacity = 32
 
 T = 200
 W = 32
-num_sparse = 8
+topk_pages = 8
+chunk_size = page_size
+token_budget = topk_pages * page_size
 
-# Query
+def make_wrapper():
+    workspace = torch.empty((256 * 1024 * 1024 // 4,), device="cuda", dtype=torch.float32)
+    return BatchDecodeWithPagedKVCacheWrapper(float_workspace_buffer=workspace, kv_layout="NHD", backend="auto")
+
+# Query (decode)
 q = torch.randn((B, Hq, D), device=device, dtype=dtype)
 
-# CPU pinned KV store
-k_cpu = torch.randn((num_pages_total, page_size, Hkv, D),
-                    device="cpu", dtype=dtype, pin_memory=True)
-v_cpu = torch.randn((num_pages_total, page_size, Hkv, D),
-                    device="cpu", dtype=dtype, pin_memory=True)
+# CPU KV (pinned)
+k_cpu = torch.randn((num_pages_total, page_size, Hkv, D), device="cpu", dtype=dtype, pin_memory=True)
+v_cpu = torch.randn((num_pages_total, page_size, Hkv, D), device="cpu", dtype=dtype, pin_memory=True)
 
 # GPU cache
 k_hbm = torch.empty((hbm_capacity, page_size, Hkv, D), device="cuda", dtype=dtype)
@@ -37,22 +54,11 @@ v_hbm = torch.empty((hbm_capacity, page_size, Hkv, D), device="cuda", dtype=dtyp
 
 slot_to_page = torch.full((hbm_capacity,), -1, dtype=torch.int32)
 page_to_slot = {}
-
 last_used_step = {}
 current_step = 0
-
-# Counters for evictions
 evictions_this_step = 0
 
-def make_wrapper():
-    workspace = torch.empty((256 * 1024 * 1024 // 4,), device="cuda", dtype=torch.float32)
-    return BatchDecodeWithPagedKVCacheWrapper(
-        float_workspace_buffer=workspace,
-        kv_layout="NHD",
-        backend="auto",
-    )
-
-def reset_state():
+def reset_cache_state():
     global page_to_slot, last_used_step, current_step
     page_to_slot = {}
     last_used_step = {}
@@ -60,11 +66,9 @@ def reset_state():
     current_step = 0
 
 def choose_victim_slot():
-    # Empty slot?
     for slot in range(hbm_capacity):
         if int(slot_to_page[slot]) == -1:
             return slot
-    # LRU
     victim_slot = 0
     victim_time = None
     for slot in range(hbm_capacity):
@@ -75,8 +79,9 @@ def choose_victim_slot():
             victim_slot = slot
     return victim_slot
 
-def load_page_to_hbm(page_id):
-    global evictions_this_step
+def load_page_to_hbm(page_id: int):
+    global current_step, evictions_this_step
+
     if page_id in page_to_slot:
         last_used_step[page_id] = current_step
         return False, 0.0
@@ -103,6 +108,7 @@ def build_page_table(needed_pages):
     slots = []
     misses = 0
     transfer_ms = 0.0
+
     for pid in needed_pages:
         miss, t_ms = load_page_to_hbm(pid)
         if miss:
@@ -116,33 +122,47 @@ def build_page_table(needed_pages):
     return indptr, indices, last_page_len, misses, transfer_ms
 
 def run_decode(wrapper, indptr, indices, last_page_len):
-    wrapper.begin_forward(
-        indptr, indices, last_page_len,
-        num_qo_heads=Hq,
-        num_kv_heads=Hkv,
-        head_dim=D,
-        page_size=page_size,
-    )
+    wrapper.begin_forward(indptr, indices, last_page_len,
+                          num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size)
     _ = wrapper.forward(q, (k_hbm, v_hbm))
     torch.cuda.synchronize()
     wrapper.end_forward()
 
-def gen_needed_pages(t):
+@torch.no_grad()
+def quest_eval_selected_pages(t: int):
+    local_lo = t
+    local_hi = t + W
+
+    k0 = k_cpu[:, :, 0, :].contiguous()
+    S = k0.shape[0] * k0.shape[1]
+    k_flat = k0.view(S, k0.shape[-1])
+
+    q0 = q[0, 0, :].detach().to("cpu")
+    scores = (k_flat @ q0).view(1, 1, 1, S)
+
+    mask = local_heavy_hitter_mask(scores, token_budget=token_budget, chunk_size=chunk_size)
+    sel_tokens = mask[0, 0, 0].nonzero(as_tuple=False).flatten()
+
+    sel_pages = torch.unique(sel_tokens // page_size).tolist()
+    sel_pages = sel_pages[:topk_pages]
+    sel_pages = [p for p in sel_pages if (p < local_lo or p >= local_hi)]
+    return sel_pages
+
+def gen_needed_pages(t: int):
     local_pages = list(range(t, t + W))
-    sparse_pages = random.sample(range(0, num_pages_total), num_sparse)
-    sparse_pages = [p for p in sparse_pages if p < t or p >= t + W]
+    sparse_pages = quest_eval_selected_pages(t)
     return local_pages, sparse_pages, local_pages + sparse_pages
 
-def run_with_prefetch(prefetch_k, csv_path):
+def run_log(prefetch_k: int, csv_path: str):
     global current_step, evictions_this_step
 
     wrapper = make_wrapper()
-    reset_state()
+    reset_cache_state()
 
     fieldnames = [
-        "t", "prefetch_k", "needed_local", "needed_sparse",
-        "evictions", "ondemand_misses", "ondemand_transfer_ms",
-        "prefetch_misses", "prefetch_transfer_ms"
+        "t","prefetch_k","needed_local","needed_sparse",
+        "evictions","ondemand_misses","ondemand_transfer_ms",
+        "prefetch_misses","prefetch_transfer_ms"
     ]
 
     with open(csv_path, "w", newline="") as f:
@@ -155,19 +175,19 @@ def run_with_prefetch(prefetch_k, csv_path):
 
             local_pages, sparse_pages, needed = gen_needed_pages(t)
 
-            # Prefetch phase
-            prefetch_misses = 0
-            prefetch_transfer = 0.0
-            if prefetch_k > 0:
-                for pid in range(t + W, t + W + prefetch_k):
+            # QUEST-aware prefetch: prefetch next step selected pages
+            pre_miss = 0
+            pre_ms = 0.0
+            if prefetch_k > 0 and (t + 1 < T):
+                next_pages = quest_eval_selected_pages(t + 1)
+                for pid in next_pages[:prefetch_k]:
                     miss, t_ms = load_page_to_hbm(pid)
                     if miss:
-                        prefetch_misses += 1
-                        prefetch_transfer += t_ms
+                        pre_miss += 1
+                        pre_ms += t_ms
 
-            # On-demand phase
+            # On-demand
             indptr, indices, last_page_len, ond_miss, ond_ms = build_page_table(needed)
-
             run_decode(wrapper, indptr, indices, last_page_len)
 
             w.writerow({
@@ -178,17 +198,17 @@ def run_with_prefetch(prefetch_k, csv_path):
                 "evictions": evictions_this_step,
                 "ondemand_misses": ond_miss,
                 "ondemand_transfer_ms": round(ond_ms, 6),
-                "prefetch_misses": prefetch_misses,
-                "prefetch_transfer_ms": round(prefetch_transfer, 6),
+                "prefetch_misses": pre_miss,
+                "prefetch_transfer_ms": round(pre_ms, 6),
             })
 
 def main():
-    # Change this value to log different runs
-    prefetch_k = 16
-    out = f"results/step_log_prefetch{prefetch_k}.csv"
-    print(f"[run] prefetch_k={prefetch_k} -> {out}")
-    run_with_prefetch(prefetch_k, out)
-    print("[done] wrote", out)
+    os.makedirs("results", exist_ok=True)
+    for k in [0, 4, 8]:
+        out = f"results/quest_eval_step_log_prefetch{k}.csv"
+        print(f"[run] prefetch_k={k} -> {out}")
+        run_log(k, out)
+    print("[done] logs written.")
 
 if __name__ == "__main__":
     main()

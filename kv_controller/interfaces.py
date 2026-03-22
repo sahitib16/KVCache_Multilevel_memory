@@ -41,3 +41,11 @@ class ResidencyController(ABC):
     @abstractmethod
     def decide(self, context: ControllerContext) -> PolicyOutput:
         """Choose evictions, prefetches, and layer budget updates."""
+
+    def observe(self, context: ControllerContext, decision: PolicyOutput, metrics) -> None:
+        """Optional feedback hook called after a step completes.
+
+        Static controllers can ignore this.
+        Adaptive / learning-based controllers can use it to update internal
+        state from the observed outcome of the action they chose.
+        """

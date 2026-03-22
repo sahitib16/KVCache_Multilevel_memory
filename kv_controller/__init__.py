@@ -18,10 +18,26 @@ What this package currently contains:
 - The main simulator loop.
 """
 
+from .benchmark import (
+    AggregateBenchmarkResult,
+    BenchmarkResult,
+    aggregate_policy_summaries,
+    benchmark_policies,
+    benchmark_policies_across_seeds,
+    collect_step_rows,
+    qtile,
+    summarize_run,
+    write_aggregate_summary_csv,
+    write_step_csv,
+    write_summary_csv,
+)
 from .interfaces import HeadWeightedScorer, ResidencyController
 from .policies import (
+    BanditAction,
     BeladyOracleController,
+    ContextualBanditController,
     FutureTraceOracle,
+    LayerAwareScoreController,
     LRUController,
     PerfectPrefetchOracleController,
     ScoreBasedController,
@@ -48,12 +64,22 @@ from .types import (
 from .workload import SyntheticTraceConfig, SyntheticTraceGenerator
 
 __all__ = [
+    "BanditAction",
+    "BeladyOracleController",
+    "AggregateBenchmarkResult",
+    "BenchmarkResult",
+    "aggregate_policy_summaries",
+    "benchmark_policies",
+    "benchmark_policies_across_seeds",
     "CacheConfig",
     "CacheState",
+    "collect_step_rows",
     "ControllerContext",
+    "ContextualBanditController",
     "FutureTraceOracle",
     "HeadWeightedScorer",
     "KVPageId",
+    "LayerAwareScoreController",
     "LayerBudget",
     "LRUController",
     "NormalizedHeadWeightedScorer",
@@ -63,6 +89,7 @@ __all__ = [
     "PerfectPrefetchOracleController",
     "PolicyDecision",
     "PolicyOutput",
+    "qtile",
     "ResidencyController",
     "ScoreBasedController",
     "SimulationConfig",
@@ -74,5 +101,8 @@ __all__ = [
     "TransferRequest",
     "TransferState",
     "WorkloadStep",
-    "BeladyOracleController",
+    "summarize_run",
+    "write_step_csv",
+    "write_summary_csv",
+    "write_aggregate_summary_csv",
 ]

@@ -101,6 +101,43 @@ class OverlapAwareSimulator:
             self.state.evict(victim, metrics.step_idx)
             metrics.evictions += 1
 
+    def _enforce_layer_budgets(
+        self,
+        required_pages: tuple[KVPageId, ...],
+        metrics: StepMetrics,
+    ) -> None:
+        """Evict over-budget layers until their occupancy fits the policy budgets.
+
+        Why this helper exists:
+        - controllers can now emit per-layer HBM budgets as part of `PolicyOutput`
+        - those budgets only matter if the simulator actively enforces them
+
+        Enforcement rule:
+        - never evict a page required by the current decode step
+        - never evict a page that is currently in flight
+        - within an over-budget layer, fall back to LRU-style victim choice
+
+        This keeps the behavior simple and understandable while making the
+        budget-control knob real for both static layer-aware policies and the
+        contextual bandit.
+        """
+
+        protected = set(required_pages) | set(self.state.inflight_pages.keys())
+
+        for layer_id, budget in self.state.layer_budgets.items():
+            max_pages = budget.max_resident_pages
+            while self.state.per_layer_occupancy.get(layer_id, 0) > max_pages:
+                candidates = [
+                    page
+                    for page in self.state.resident_pages
+                    if page.layer_id == layer_id and page not in protected
+                ]
+                if not candidates:
+                    break
+                victim = min(candidates, key=lambda page: self.state.last_access_step.get(page, -1))
+                self.state.evict(victim, metrics.step_idx)
+                metrics.evictions += 1
+
     def run_step(self, step: WorkloadStep, controller: ResidencyController) -> StepMetrics:
         """Run one decode step from controller decision to decode completion."""
 
@@ -122,6 +159,7 @@ class OverlapAwareSimulator:
         # Apply any layer budget changes first so later policy logic can honor
         # the new budget picture.
         self.state.apply_layer_budgets(decision.layer_budgets)
+        self._enforce_layer_budgets(step.required_pages, metrics)
         self._evict_if_needed(step.required_pages, decision, metrics)
 
         # Submit proactive prefetches chosen by the controller.
@@ -176,6 +214,7 @@ class OverlapAwareSimulator:
         metrics.transfer_backlog = self.state.transfer_state.backlog
         metrics.churn = self.state.churn
         self.state.register_miss_batch(demand_misses, len(step.required_pages))
+        controller.observe(context, decision, metrics)
         return metrics
 
     def run(self, trace: list[WorkloadStep], controller: ResidencyController) -> list[StepMetrics]:

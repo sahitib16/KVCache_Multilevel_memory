@@ -104,12 +104,30 @@ Current controllers:
 - `ScoreBasedController`: uses head-weighted scores to guide prefetch and eviction
 - `BeladyOracleController`: future-aware eviction oracle
 - `PerfectPrefetchOracleController`: future-aware prefetch oracle
+- `ContextualBanditController`: adaptive controller that learns over a small action set
 
 Helper:
 - `FutureTraceOracle`: exposes next-use information from a known trace
+- `BanditAction`: interpretable action object for the contextual bandit
 
 Why this file matters:
 - this is where the simulator becomes useful for comparing controller quality
+- this is also where the first adaptive / learning-based controller lives
+
+### [`benchmark.py`](/home/sbulusu31/kv_multilevel/kv_controller/benchmark.py)
+
+Purpose:
+- provides reusable benchmarking helpers for policy comparison
+
+What it does:
+- runs multiple policies on the same fixed trace
+- collects step-level rows
+- builds summary rows
+- writes step and summary CSV files
+
+Why this file matters:
+- it finishes an important remaining part of Step 3 by making policy
+  comparison reusable outside the CLI script
 
 ### [`state.py`](/home/sbulusu31/kv_multilevel/kv_controller/state.py)
 
@@ -199,8 +217,8 @@ Why this file matters:
 
 ## How To Use The Current Step 1 Core
 
-Right now, Steps 1-3 give you infrastructure, explicit engine-level interfaces,
-and the first set of baseline/oracle policies.
+Right now, Steps 1-4 give you infrastructure, explicit engine-level interfaces,
+baseline/oracle policies, and a first adaptive controller.
 
 Typical usage looks like this:
 
@@ -256,6 +274,8 @@ python scripts/run_kv_controller_sim.py --policy lru --print-steps
 python scripts/run_kv_controller_sim.py --policy score --prefetch-k 2 --print-steps
 python scripts/run_kv_controller_sim.py --policy belady
 python scripts/run_kv_controller_sim.py --policy perfect_prefetch --prefetch-k 2
+python scripts/run_kv_controller_sim.py --policy bandit --print-steps
+python scripts/run_kv_controller_sim.py --policy-suite lru,score,belady,perfect_prefetch,bandit
 ```
 
 ## How To Test That The Simulator Core Is Working
@@ -275,10 +295,11 @@ python scripts/run_kv_controller_sim.py --print-steps
 
 What this gives you:
 - a synthetic trace
-- a very small baseline controller
+- one policy or a policy suite
 - per-step metrics if you ask for them
 - a final summary showing demand misses, stall, evictions, slot-map size, and
   transfer-state status
+- optional step-level / summary CSV output
 
 This is the easiest “does the simulator run end to end?” check.
 
@@ -302,6 +323,56 @@ What these tests check:
 - the simulator raises if that invariant is violated
 - HBM format is recorded as uniform
 - the old `PolicyDecision` name still works as an alias
+- the contextual bandit observes reward feedback after each step
+
+## Current Test Commands
+
+These are the most useful commands for validating and comparing the current
+implementation.
+
+Syntax and test suite:
+
+```bash
+python -m py_compile kv_controller/*.py scripts/run_kv_controller_sim.py tests/test_kv_controller_core.py
+pytest tests/test_kv_controller_core.py
+```
+
+Single-policy debug runs:
+
+```bash
+python scripts/run_kv_controller_sim.py --policy lru --print-steps
+python scripts/run_kv_controller_sim.py --policy score --prefetch-k 2 --print-steps
+python scripts/run_kv_controller_sim.py --policy belady
+python scripts/run_kv_controller_sim.py --policy perfect_prefetch --prefetch-k 2
+python scripts/run_kv_controller_sim.py --policy bandit --print-steps
+```
+
+Multi-policy comparison on one fixed trace:
+
+```bash
+python scripts/run_kv_controller_sim.py --policy-suite lru,score,belady,perfect_prefetch,bandit
+```
+
+Commands that specifically show the stall-accounting fix and the updated
+bandit behavior:
+
+```bash
+python scripts/run_kv_controller_sim.py --policy bandit --print-steps
+python scripts/run_kv_controller_sim.py --policy-suite lru,score,belady,perfect_prefetch,bandit
+python scripts/run_kv_controller_sim.py --steps 64 --policy-suite lru,score,belady,perfect_prefetch,bandit
+```
+
+How to read those:
+- the first command should now show varying `stall_ms` by step rather than one flat value everywhere
+- the second command shows short-run policy comparison on the default 12-step trace
+- the third command gives the bandit enough runway to learn, which is usually a fairer adaptive-controller check
+
+CSV output:
+
+```bash
+python scripts/run_kv_controller_sim.py --policy score --step-csv results/kv_steps.csv
+python scripts/run_kv_controller_sim.py --policy-suite lru,score,belady,perfect_prefetch,bandit --summary-csv results/kv_summary.csv
+```
 
 ## What “Head-Weighted” Means In The Current Core
 
@@ -350,14 +421,25 @@ Done in Step 3:
 - baseline controllers now exist
 - future-aware oracle controllers now exist
 - the driver script can now switch between baseline and oracle policies
+- the driver can compare multiple policies on the same trace and write CSV outputs
+
+Done in Step 4:
+- a first adaptive / learning-based controller now exists
+- the adaptive controller is a lightweight contextual bandit over a small action set
+- the simulator now calls controller feedback hooks after each step
+- the driver can run bandit mode and compare it against static/oracle policies
+- reusable benchmark helpers now exist outside the driver script
+- the bandit now has adaptive layer-budget mode
+- the bandit now has adaptive transfer-pressure prefetch guarding
+- the bandit uses one-step delayed reward credit so prefetch decisions are credited closer to when they pay off
+- stall accounting now includes demand-transfer queue delay, so latency differences between policies are visible
 
 Not done yet:
-- real baseline controllers
-- Belady eviction oracle
-- perfect-prefetch oracle
-- contextual bandit controller
-- CSV-writing CLI driver
 - integration with your older experiment scripts
+- real model-derived head-weight estimation from eager attention logs
+- real vLLM trace replay / shadow-mode adapter
+- CPU-tier compression control
+- richer adaptive knobs beyond the current bandit action set
 
 ## How This README Should Be Updated Later
 

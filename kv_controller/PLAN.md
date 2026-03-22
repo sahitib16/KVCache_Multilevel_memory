@@ -10,10 +10,30 @@ The repo already proves the core motivation and has a usable experimental base:
 The main gap is architectural: the project is still a set of duplicated scripts with forced `torch.cuda.synchronize()` behavior, not a reusable engine-level controller with explicit overlap, pluggable policies, oracle bounds, or layer-aware state.
 
 Current project status:
-- Steps 1-3 are now implemented in the new `kv_controller/` package.
+- Steps 1-4 are now implemented in the new `kv_controller/` package.
 - The simulator core exists, has explicit page-level interfaces, and is covered by automated tests.
 - Static baseline controllers and future-aware oracle controllers now exist.
-- The first adaptive / learning-based controller has **not** been implemented yet. That begins in Step 4.
+- The first adaptive / learning-based controller now exists as a lightweight contextual bandit.
+
+Implemented now:
+- reusable simulator core (`types`, `state`, `scheduler`, `simulator`, `workload`)
+- explicit page-level engine interfaces
+- overlap-aware discrete-event transfer model
+- required head-weighted scoring plumbing
+- baseline controllers (`LRU`, `score-based`)
+- oracle controllers (`Belady`, `perfect prefetch`)
+- first adaptive controller (`ContextualBanditController`)
+- reusable benchmark helpers and CLI driver
+- automated tests for core invariants and policy wiring
+
+Not implemented yet:
+- real-model / real-engine-derived head-weight estimation
+- QUEST/min-max/repo-eval scorers inside the new scorer layer
+- adaptive layer-budget control
+- compression policy and compression-aware transfer model
+- richer benchmark reporting with stronger parity to old script experiments
+- more discriminative stall/latency model across policies
+- vLLM trace replay / shadow mode / gated live integration
 
 ## Implementation Changes
 1. Consolidate the simulator into a reusable core package.
@@ -65,7 +85,8 @@ Status:
 
 Status:
 - Mostly done at the policy level. Belady-style and perfect-prefetch oracle controllers now exist.
-- Still pending: richer benchmark output so oracle-vs-baseline comparisons are reported systematically, not just through ad hoc smoke summaries.
+- There is now a repeatable multi-policy runner with optional CSV output.
+- Still pending: a more polished benchmark harness with richer reporting and closer parity to the older script-based experiments.
 
 6. Formalize page scoring as a pluggable signal, not a hard-coded selector.
 - Generalize current QUEST/min-max/repo-eval code into a `PageScorer` interface.
@@ -113,7 +134,11 @@ Status:
 - Start with epsilon-greedy LinUCB or a simple contextual Thompson variant; do not use heavy RL.
 
 Status:
-- Not started yet. This is the first step where adaptive / learning-based behavior will be implemented.
+- Done for the first version. A lightweight contextual bandit controller now chooses among a small interpretable action set.
+- The current action set covers:
+  - eviction rule `{LRU, score-based}`
+  - prefetch depth `{0, 2, 4}`
+- Future expansion can add layer budgeting and compression toggles once those behaviors are implemented.
 
 Implementation note for Step 4:
 - The bandit should sit above the existing static policy building blocks rather than replacing the simulator.
@@ -122,6 +147,10 @@ Implementation note for Step 4:
   - prefetch depth `{0, 2, 4, 8}`
   - layer budgeting `{off, on}`
   - compression `{off, on}` once compression exists
+
+Current note:
+- The first version now updates from per-step reward using a LinUCB-style model.
+- It is intentionally lightweight and inspectable, not a heavy RL agent.
 
 9. Treat CPU-tier compression as optional and isolated.
 - Add it only after the non-compressed controller is working.
@@ -145,8 +174,8 @@ Implementation note for Step 4:
 - Include `mean`, `p95`, `p99` for stall, miss rate, backlog, churn, wasted prefetch, overlap efficiency, and per-layer occupancy skew.
 
 Status:
-- In progress. There is now a simple simulator driver script and automated tests.
-- A full benchmark/CSV runner for systematic policy comparison is still pending.
+- In progress. There is now a simulator driver, automated tests, multi-policy comparison mode, and optional step/summary CSV output.
+- A more polished benchmark harness is still pending, but the current driver is already sufficient for repeatable policy comparisons.
 
 ## Test Plan
 - Unit tests for cache invariants: slot map consistency, no duplicate residency, eviction correctness, and protected needed pages not evicted within a step.

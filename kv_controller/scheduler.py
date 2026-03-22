@@ -100,7 +100,23 @@ class OverlapTransferScheduler:
             state.enqueue_transfer(page)
             earliest_ready, _, _ = self._active_heap[0]
             start_ms = max(start_ms, earliest_ready)
-            metrics.queue_delay_ms += max(0.0, start_ms - self.now_ms)
+            queue_delay_ms = max(0.0, start_ms - self.now_ms)
+            metrics.queue_delay_ms += queue_delay_ms
+
+            # Important accounting note:
+            # If this is a DEMAND transfer, the decode step is effectively
+            # blocked while we wait for a copy lane to free up. Earlier
+            # versions only counted the *final* wait in `wait_for_pages`,
+            # which made stall time look artificially flat across policies.
+            #
+            # By charging demand-side queueing delay into stall here, the
+            # simulator now reflects the real effect of:
+            # - more misses
+            # - more transfer contention
+            # - prefetches occupying copy capacity before demand requests
+            if kind == TransferKind.DEMAND:
+                metrics.stall_ms += queue_delay_ms
+                metrics.transfer_wait_ms += queue_delay_ms
             self.advance_to(start_ms, state)
             state.dequeue_transfer(page)
 

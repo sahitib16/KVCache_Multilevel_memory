@@ -399,6 +399,52 @@ class BanditAction:
     guard_mode: bool = False
 
 
+def build_bandit_action_menu(name: str) -> tuple[BanditAction, ...]:
+    """Return a named action-menu preset for bandit experiments.
+
+    Why named menus:
+    - we want to compare a few interpretable action sets
+    - putting them in one helper keeps experiments reproducible
+    - replay-based tuning can then ask:
+      "does a smaller or more score-heavy menu generalize better?"
+    """
+
+    menus = {
+        "full": (
+            BanditAction("lru", 0, False, False),
+            BanditAction("lru", 2, False, False),
+            BanditAction("score", 0, False, False),
+            BanditAction("score", 2, False, False),
+            BanditAction("score", 4, False, False),
+            BanditAction("score", 2, True, False),
+            BanditAction("score", 2, False, True),
+            BanditAction("score", 4, False, True),
+            BanditAction("score", 2, True, True),
+        ),
+        "trimmed": (
+            BanditAction("lru", 0, False, False),
+            BanditAction("lru", 2, False, False),
+            BanditAction("score", 0, False, False),
+            BanditAction("score", 2, False, False),
+            BanditAction("score", 4, False, False),
+            BanditAction("score", 2, True, False),
+            BanditAction("score", 2, False, True),
+            BanditAction("score", 4, False, True),
+        ),
+        "score_heavy": (
+            BanditAction("lru", 0, False, False),
+            BanditAction("score", 0, False, False),
+            BanditAction("score", 2, False, False),
+            BanditAction("score", 4, False, False),
+            BanditAction("score", 2, True, False),
+            BanditAction("score", 2, False, True),
+        ),
+    }
+    if name not in menus:
+        raise ValueError(f"Unknown bandit action menu: {name}")
+    return menus[name]
+
+
 class ContextualBanditController(ResidencyController):
     """Lightweight contextual bandit over a small controller action space.
 
@@ -424,30 +470,24 @@ class ContextualBanditController(ResidencyController):
         alpha: float = 0.35,
         prefetch_penalty: float = 0.001,
         eviction_penalty: float = 0.001,
-        miss_penalty: float = 0.08,
-        useful_prefetch_bonus: float = 0.04,
-        wasted_prefetch_penalty: float = 0.02,
+        miss_penalty: float = 0.12,
+        useful_prefetch_bonus: float = 0.06,
+        wasted_prefetch_penalty: float = 0.03,
+        miss_reduction_bonus: float = 0.02,
+        miss_increase_penalty: float = 0.04,
         bootstrap_action: BanditAction | None = None,
         bootstrap_steps: int = 2,
     ):
-        self.actions = actions or (
-            BanditAction("lru", 0, False, False),
-            BanditAction("lru", 2, False, False),
-            BanditAction("score", 0, False, False),
-            BanditAction("score", 2, False, False),
-            BanditAction("score", 4, False, False),
-            BanditAction("score", 2, True, False),
-            BanditAction("score", 2, False, True),
-            BanditAction("score", 4, False, True),
-            BanditAction("score", 2, True, True),
-        )
+        self.actions = actions or build_bandit_action_menu("trimmed")
         self.alpha = alpha
         self.prefetch_penalty = prefetch_penalty
         self.eviction_penalty = eviction_penalty
         self.miss_penalty = miss_penalty
         self.useful_prefetch_bonus = useful_prefetch_bonus
         self.wasted_prefetch_penalty = wasted_prefetch_penalty
-        self.bootstrap_action = bootstrap_action or BanditAction("score", 2, True, True)
+        self.miss_reduction_bonus = miss_reduction_bonus
+        self.miss_increase_penalty = miss_increase_penalty
+        self.bootstrap_action = bootstrap_action or BanditAction("score", 2, True, False)
         self.bootstrap_steps = bootstrap_steps
 
         # Feature dimension is fixed by `_features`.
@@ -484,6 +524,11 @@ class ContextualBanditController(ResidencyController):
         self.pending_action: BanditAction | None = None
         self.pending_features: np.ndarray | None = None
         self.pending_prefetched_pages: frozenset[KVPageId] = frozenset()
+        self.total_useful_prefetches = 0
+        self.total_wasted_prefetches = 0
+        self.total_miss_reduction = 0.0
+        self.total_miss_increase = 0.0
+        self.action_counts: dict[BanditAction, int] = {action: 0 for action in self.actions}
 
     def _features(self, context: ControllerContext) -> np.ndarray:
         """Turn the current controller context into a small numeric feature vector.
@@ -530,6 +575,23 @@ class ContextualBanditController(ResidencyController):
             ],
             dtype=np.float64,
         )
+
+    def _feature_names(self) -> list[str]:
+        """Return human-readable names for the linear bandit feature vector."""
+
+        return [
+            "bias",
+            "miss_rate",
+            "occupancy_ratio",
+            "backlog_ratio",
+            "inflight_ratio",
+            "scaled_churn",
+            "avg_required_score",
+            "avg_predicted_score",
+            "prev_stall_ms",
+            "prev_demand_misses",
+            "prev_evictions",
+        ]
 
     def _linucb_score(self, action: BanditAction, features: np.ndarray) -> float:
         """Compute UCB score for one action under the current context."""
@@ -578,6 +640,7 @@ class ContextualBanditController(ResidencyController):
             self.last_action = chosen
             self.last_features = features
             self.last_ucb_scores = {chosen: 0.0}
+            self.action_counts[chosen] += 1
             return self._action_to_policy(chosen).decide(context)
 
         features = self._features(context)
@@ -590,6 +653,7 @@ class ContextualBanditController(ResidencyController):
         self.last_action = chosen
         self.last_features = features
         self.last_ucb_scores = ucb_scores
+        self.action_counts[chosen] += 1
 
         decision = self._action_to_policy(chosen).decide(context)
         return decision
@@ -631,10 +695,18 @@ class ContextualBanditController(ResidencyController):
 
         useful_prefetches = len(self.pending_prefetched_pages & set(context.required_pages))
         wasted_prefetches = len(self.pending_prefetched_pages - set(context.required_pages))
+        miss_reduction = max(0.0, self.prev_demand_misses - float(metrics.demand_misses))
+        miss_increase = max(0.0, float(metrics.demand_misses) - self.prev_demand_misses)
         delayed_reward += (
             self.useful_prefetch_bonus * useful_prefetches
             - self.wasted_prefetch_penalty * wasted_prefetches
+            + self.miss_reduction_bonus * miss_reduction
+            - self.miss_increase_penalty * miss_increase
         )
+        self.total_useful_prefetches += useful_prefetches
+        self.total_wasted_prefetches += wasted_prefetches
+        self.total_miss_reduction += miss_reduction
+        self.total_miss_increase += miss_increase
 
         # The previous action receives credit for the current step's realized
         # performance, because that is when its proactive decisions paid off.
@@ -660,9 +732,25 @@ class ContextualBanditController(ResidencyController):
     def diagnostics(self) -> dict[str, object]:
         """Return lightweight debugging info for summaries and tests."""
 
+        theta_by_action = {}
+        for action in self.actions:
+            A_inv = np.linalg.inv(self._A[action])
+            theta_by_action[str(action)] = (A_inv @ self._b[action]).tolist()
+
         return {
             "steps_observed": self.steps_observed,
             "total_reward": self.total_reward,
             "last_action": self.last_action,
             "last_ucb_scores": {str(action): score for action, score in self.last_ucb_scores.items()},
+            "feature_names": self._feature_names(),
+            "theta_by_action": theta_by_action,
+            "action_counts": {str(action): count for action, count in self.action_counts.items()},
+            "total_useful_prefetches": self.total_useful_prefetches,
+            "total_wasted_prefetches": self.total_wasted_prefetches,
+            "prefetch_hit_rate": (
+                self.total_useful_prefetches
+                / max(1, self.total_useful_prefetches + self.total_wasted_prefetches)
+            ),
+            "total_miss_reduction": self.total_miss_reduction,
+            "total_miss_increase": self.total_miss_increase,
         }

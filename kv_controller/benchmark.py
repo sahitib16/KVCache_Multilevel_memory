@@ -101,6 +101,11 @@ def summarize_run(policy_name: str, metrics, simulator, controller) -> dict[str,
         summary["bandit_steps_observed"] = diag["steps_observed"]
         summary["bandit_total_reward"] = diag["total_reward"]
         summary["bandit_last_action"] = str(diag["last_action"])
+        summary["bandit_total_useful_prefetches"] = diag["total_useful_prefetches"]
+        summary["bandit_total_wasted_prefetches"] = diag["total_wasted_prefetches"]
+        summary["bandit_prefetch_hit_rate"] = diag["prefetch_hit_rate"]
+        summary["bandit_total_miss_reduction"] = diag["total_miss_reduction"]
+        summary["bandit_total_miss_increase"] = diag["total_miss_increase"]
 
     return summary
 
@@ -182,7 +187,7 @@ def aggregate_policy_summaries(
     prefetch_values = values("total_prefetches_submitted")
     eviction_values = values("total_evictions")
 
-    return {
+    aggregate = {
         "policy": policy_name,
         "seeds": len(per_seed_summaries),
         "avg_total_demand_misses": statistics.mean(miss_values),
@@ -198,6 +203,24 @@ def aggregate_policy_summaries(
         "std_total_prefetches_submitted": statistics.pstdev(prefetch_values) if len(prefetch_values) > 1 else 0.0,
         "std_total_evictions": statistics.pstdev(eviction_values) if len(eviction_values) > 1 else 0.0,
     }
+
+    if "bandit_total_useful_prefetches" in per_seed_summaries[0]:
+        useful_values = values("bandit_total_useful_prefetches")
+        wasted_values = values("bandit_total_wasted_prefetches")
+        hit_rate_values = values("bandit_prefetch_hit_rate")
+        miss_reduction_values = values("bandit_total_miss_reduction")
+        miss_increase_values = values("bandit_total_miss_increase")
+        aggregate.update(
+            {
+                "avg_bandit_total_useful_prefetches": statistics.mean(useful_values),
+                "avg_bandit_total_wasted_prefetches": statistics.mean(wasted_values),
+                "avg_bandit_prefetch_hit_rate": statistics.mean(hit_rate_values),
+                "avg_bandit_total_miss_reduction": statistics.mean(miss_reduction_values),
+                "avg_bandit_total_miss_increase": statistics.mean(miss_increase_values),
+            }
+        )
+
+    return aggregate
 
 
 def benchmark_policies_across_seeds(

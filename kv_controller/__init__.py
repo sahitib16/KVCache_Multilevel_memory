@@ -35,6 +35,7 @@ from .interfaces import HeadWeightedScorer, ResidencyController
 from .policies import (
     BanditAction,
     BeladyOracleController,
+    build_bandit_action_menu,
     ContextualBanditController,
     FutureTraceOracle,
     LayerAwareScoreController,
@@ -42,7 +43,15 @@ from .policies import (
     PerfectPrefetchOracleController,
     ScoreBasedController,
 )
-from .scoring import NormalizedHeadWeightedScorer, PassthroughHeadWeightedScorer
+from .replay import load_trace_json, save_trace_json, trace_to_json_rows
+from .scoring import (
+    HeadActivityRecomputedScorer,
+    LayerNormalizedHeadActivityScorer,
+    NormalizedHeadWeightedScorer,
+    PassthroughHeadWeightedScorer,
+    PredictedBoostedHeadActivityScorer,
+    apply_scorer_to_trace,
+)
 from .scheduler import OverlapTransferScheduler
 from .simulator import OverlapAwareSimulator
 from .state import CacheState
@@ -71,6 +80,7 @@ __all__ = [
     "aggregate_policy_summaries",
     "benchmark_policies",
     "benchmark_policies_across_seeds",
+    "build_bandit_action_menu",
     "CacheConfig",
     "CacheState",
     "collect_step_rows",
@@ -78,20 +88,26 @@ __all__ = [
     "ContextualBanditController",
     "FutureTraceOracle",
     "HeadWeightedScorer",
+    "HeadActivityRecomputedScorer",
     "KVPageId",
+    "LayerNormalizedHeadActivityScorer",
     "LayerAwareScoreController",
     "LayerBudget",
+    "load_trace_json",
     "LRUController",
     "NormalizedHeadWeightedScorer",
     "OverlapTransferScheduler",
     "OverlapAwareSimulator",
     "PassthroughHeadWeightedScorer",
     "PerfectPrefetchOracleController",
+    "PredictedBoostedHeadActivityScorer",
     "PolicyDecision",
     "PolicyOutput",
     "qtile",
     "ResidencyController",
     "ScoreBasedController",
+    "apply_scorer_to_trace",
+    "save_trace_json",
     "SimulationConfig",
     "StepMetrics",
     "SyntheticTraceConfig",
@@ -100,6 +116,7 @@ __all__ = [
     "TransferKind",
     "TransferRequest",
     "TransferState",
+    "trace_to_json_rows",
     "WorkloadStep",
     "summarize_run",
     "write_step_csv",

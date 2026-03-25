@@ -170,6 +170,10 @@ class SyntheticTraceGenerator:
                 page: self._score(page, head_weights[page.layer_id])
                 for page in page_set
             }
+            per_page_head_activity = {
+                page: self._head_activity[page]
+                for page in page_set
+            }
             per_page_features = {
                 page: {
                     "head_weighted_score": head_weighted_scores[page],
@@ -188,6 +192,7 @@ class SyntheticTraceGenerator:
                     predicted_pages=predicted_pages,
                     head_weighted_scores=head_weighted_scores,
                     query_head_weights=head_weights,
+                    per_page_head_activity=per_page_head_activity,
                     per_page_features=per_page_features,
                     referenced_layers=referenced_layers,
                 )

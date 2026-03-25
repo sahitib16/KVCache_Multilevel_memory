@@ -59,6 +59,7 @@ class OverlapAwareSimulator:
             churn=self.state.churn,
             per_layer_occupancy=dict(self.state.per_layer_occupancy),
             head_weighted_scores=step.head_weighted_scores,
+            per_page_head_activity=step.per_page_head_activity,
             per_page_features=step.per_page_features,
             query_head_weights=step.query_head_weights,
             layer_budgets=dict(self.state.layer_budgets),

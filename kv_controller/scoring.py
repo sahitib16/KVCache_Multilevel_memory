@@ -14,6 +14,8 @@ That way:
 - the controller is responsible for acting on them
 """
 
+from dataclasses import replace
+
 from .interfaces import HeadWeightedScorer
 from .types import KVPageId, WorkloadStep
 
@@ -36,6 +38,27 @@ class PassthroughHeadWeightedScorer(HeadWeightedScorer):
         # Return a copy so downstream code can mutate its local view without
         # accidentally changing the original step object.
         return dict(step.head_weighted_scores)
+
+
+class HeadActivityRecomputedScorer(HeadWeightedScorer):
+    """Recompute the score directly from stored per-head page activity.
+
+    Why this scorer matters:
+    - it uses the more primitive replayable signal instead of trusting the
+      already-baked aggregate score
+    - it is the simplest "realism check" now that traces preserve
+      `per_page_head_activity`
+
+    Formula:
+        score(page) = sum_h query_head_weight[layer, h] * page_head_activity(page, h)
+    """
+
+    def score_step(self, step: WorkloadStep) -> dict[KVPageId, float]:
+        scores: dict[KVPageId, float] = {}
+        for page, activity in step.per_page_head_activity.items():
+            layer_weights = step.query_head_weights.get(page.layer_id, ())
+            scores[page] = sum(weight * value for weight, value in zip(layer_weights, activity))
+        return scores
 
 
 class NormalizedHeadWeightedScorer(HeadWeightedScorer):
@@ -71,3 +94,86 @@ class NormalizedHeadWeightedScorer(HeadWeightedScorer):
             page: (score - lo) / (hi - lo)
             for page, score in raw.items()
         }
+
+
+class LayerNormalizedHeadActivityScorer(HeadWeightedScorer):
+    """Recompute scores from head activity, then normalize within each layer.
+
+    Why layer-local normalization can help:
+    - some layers may naturally produce larger raw score magnitudes
+    - cross-layer competition can then become more about scale than about true
+      relative importance
+    - layer-normalized scores reduce that effect while keeping within-layer
+      ranking intact
+    """
+
+    def __init__(self):
+        self._base = HeadActivityRecomputedScorer()
+
+    def score_step(self, step: WorkloadStep) -> dict[KVPageId, float]:
+        raw = self._base.score_step(step)
+        by_layer: dict[int, list[tuple[KVPageId, float]]] = {}
+        for page, score in raw.items():
+            by_layer.setdefault(page.layer_id, []).append((page, score))
+
+        normalized: dict[KVPageId, float] = {}
+        for layer_id, rows in by_layer.items():
+            values = [score for _, score in rows]
+            lo = min(values)
+            hi = max(values)
+            if hi == lo:
+                for page, _ in rows:
+                    normalized[page] = 1.0
+                continue
+            for page, score in rows:
+                normalized[page] = (score - lo) / (hi - lo)
+        return normalized
+
+
+class PredictedBoostedHeadActivityScorer(HeadWeightedScorer):
+    """Recompute scores from head activity and slightly boost predicted pages.
+
+    This is a simple proxy for "pages likely needed soon should count a bit
+    more" without changing the underlying page ordering too aggressively.
+    """
+
+    def __init__(self, predicted_boost: float = 1.15):
+        self.predicted_boost = predicted_boost
+        self._base = HeadActivityRecomputedScorer()
+
+    def score_step(self, step: WorkloadStep) -> dict[KVPageId, float]:
+        base_scores = self._base.score_step(step)
+        predicted = set(step.predicted_pages)
+        return {
+            page: score * (self.predicted_boost if page in predicted else 1.0)
+            for page, score in base_scores.items()
+        }
+
+
+def apply_scorer_to_trace(trace: list[WorkloadStep], scorer: HeadWeightedScorer) -> list[WorkloadStep]:
+    """Return a new trace whose step scores come from `scorer`.
+
+    This helper is the key replay-side tuning primitive:
+    - load one fixed trace
+    - apply several scorers to that exact trace
+    - compare policy quality without changing the workload itself
+    """
+
+    rescored_trace: list[WorkloadStep] = []
+    for step in trace:
+        rescored = scorer.score_step(step)
+        updated_features = {
+            page: {
+                **features,
+                "head_weighted_score": rescored.get(page, features.get("head_weighted_score", 0.0)),
+            }
+            for page, features in step.per_page_features.items()
+        }
+        rescored_trace.append(
+            replace(
+                step,
+                head_weighted_scores=rescored,
+                per_page_features=updated_features,
+            )
+        )
+    return rescored_trace

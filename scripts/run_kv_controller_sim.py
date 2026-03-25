@@ -29,10 +29,13 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from kv_controller import (
+    aggregate_policy_summaries,
     BeladyOracleController,
     CacheConfig,
     ContextualBanditController,
     benchmark_policies,
+    benchmark_policies_across_seeds,
+    load_trace_json,
     LRUController,
     OverlapAwareSimulator,
     PerfectPrefetchOracleController,
@@ -43,6 +46,8 @@ from kv_controller import (
     SyntheticTraceConfig,
     SyntheticTraceGenerator,
     TransferConfig,
+    save_trace_json,
+    write_aggregate_summary_csv,
     write_step_csv,
     write_summary_csv,
 )
@@ -81,6 +86,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-heads", type=int, default=8)
     parser.add_argument("--query-jitter", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed-list",
+        type=str,
+        default="",
+        help="Comma-separated seed list for multi-seed aggregate benchmarking.",
+    )
+    parser.add_argument(
+        "--trace-json",
+        type=str,
+        default="",
+        help="Replay an offline trace from JSON instead of generating a synthetic one.",
+    )
+    parser.add_argument(
+        "--save-trace-json",
+        type=str,
+        default="",
+        help="Save the generated synthetic trace to JSON for later replay.",
+    )
 
     # Memory/transfer model arguments.
     parser.add_argument("--hbm-capacity-pages", type=int, default=20)
@@ -111,13 +134,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--print-steps", action="store_true")
     parser.add_argument("--step-csv", type=str, default="")
     parser.add_argument("--summary-csv", type=str, default="")
+    parser.add_argument("--aggregate-summary-csv", type=str, default="")
     return parser
 
 
-def build_trace(args) -> list:
-    """Generate one synthetic trace that all compared policies will share."""
+def build_trace(args, seed_override: int | None = None) -> list:
+    """Generate one synthetic trace.
 
-    return SyntheticTraceGenerator(
+    When `seed_override` is provided, it replaces the CLI seed. This keeps the
+    same trace-shape arguments while allowing fair multi-seed evaluation.
+    """
+
+    if args.trace_json:
+        return load_trace_json(args.trace_json)
+
+    trace = SyntheticTraceGenerator(
         SyntheticTraceConfig(
             steps=args.steps,
             layers=args.layers,
@@ -127,9 +158,12 @@ def build_trace(args) -> list:
             predicted_prefetch_pages=args.predicted_prefetch_pages,
             attention_heads=args.attention_heads,
             query_jitter=args.query_jitter,
-            seed=args.seed,
+            seed=args.seed if seed_override is None else seed_override,
         )
     ).generate()
+    if args.save_trace_json and seed_override is None:
+        save_trace_json(args.save_trace_json, trace)
+    return trace
 
 
 def build_simulator(args) -> OverlapAwareSimulator:
@@ -210,9 +244,34 @@ def print_summary_table(summaries: list[dict[str, object]]) -> None:
         )
 
 
+def print_aggregate_summary_table(summaries: list[dict[str, object]]) -> None:
+    """Print a compact cross-seed comparison table.
+
+    This table focuses on the metrics that matter most for Step 4 tuning:
+    - average misses
+    - average mean stall
+    - average tail stall
+    - average prefetch volume
+    - average evictions
+    """
+
+    print("\nAGGREGATE SUMMARY")
+    print("policy | seeds | avg_miss | avg_mean_stall | avg_p95 | avg_p99 | avg_prefetch | avg_evictions")
+    for row in summaries:
+        print(
+            f"{str(row['policy']):>16} | "
+            f"{int(row['seeds']):>5} | "
+            f"{float(row['avg_total_demand_misses']):>8.2f} | "
+            f"{float(row['avg_mean_stall_ms']):>14.4f} | "
+            f"{float(row['avg_p95_stall_ms']):>7.4f} | "
+            f"{float(row['avg_p99_stall_ms']):>7.4f} | "
+            f"{float(row['avg_total_prefetches_submitted']):>12.2f} | "
+            f"{float(row['avg_total_evictions']):>13.2f}"
+        )
+
+
 def main() -> None:
     args = build_parser().parse_args()
-    trace = build_trace(args)
 
     # Support either one policy or a comma-separated suite.
     policies = (
@@ -220,6 +279,29 @@ def main() -> None:
         if args.policy_suite
         else [args.policy]
     )
+
+    default_suite_seed_list = "0,1,2,3,4"
+    effective_seed_list = args.seed_list
+    if args.policy_suite and not effective_seed_list and not args.trace_json:
+        # Policy-suite comparisons are now aggregate-by-default because adaptive
+        # controller quality is too noisy to judge from one seed alone.
+        effective_seed_list = default_suite_seed_list
+
+    if effective_seed_list:
+        seeds = [int(seed.strip()) for seed in effective_seed_list.split(",") if seed.strip()]
+        aggregate_results = benchmark_policies_across_seeds(
+            policy_names=policies,
+            seeds=seeds,
+            trace_builder=lambda seed: build_trace(args, seed_override=seed),
+            simulator_builder=lambda: build_simulator(args),
+            controller_builder=lambda policy_name, trace: build_controller(policy_name, args, trace),
+        )
+        aggregate_summaries = [result.aggregate_summary for result in aggregate_results]
+        print_aggregate_summary_table(aggregate_summaries)
+        write_aggregate_summary_csv(args.aggregate_summary_csv or args.summary_csv, aggregate_results)
+        return
+
+    trace = build_trace(args)
     results = benchmark_policies(
         policy_names=policies,
         trace=trace,

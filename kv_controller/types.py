@@ -140,6 +140,13 @@ class WorkloadStep:
     - Per-layer head weights for the current step. These explain where the
       head-weighted scores came from and can be used by future controllers.
 
+    ``per_page_head_activity``:
+    - Optional per-page activity vector across heads.
+    - This is the more primitive signal that the head-weighted score is built
+      from.
+    - Carrying it in the step object gives us a clean place to store richer
+      future traces collected from real model runs.
+
     ``per_page_features``:
     - Optional extra features for each page.
     - This gives the interface a place for future signals like recency proxy,
@@ -156,6 +163,7 @@ class WorkloadStep:
     predicted_pages: tuple[KVPageId, ...]
     head_weighted_scores: dict[KVPageId, float]
     query_head_weights: dict[int, tuple[float, ...]]
+    per_page_head_activity: dict[KVPageId, tuple[float, ...]] = field(default_factory=dict)
     per_page_features: dict[KVPageId, dict[str, float]] = field(default_factory=dict)
     referenced_layers: tuple[int, ...] = ()
 
@@ -188,6 +196,7 @@ class ControllerContext:
     churn: int
     per_layer_occupancy: dict[int, int]
     head_weighted_scores: dict[KVPageId, float]
+    per_page_head_activity: dict[KVPageId, tuple[float, ...]]
     per_page_features: dict[KVPageId, dict[str, float]]
     query_head_weights: dict[int, tuple[float, ...]]
     layer_budgets: dict[int, LayerBudget]

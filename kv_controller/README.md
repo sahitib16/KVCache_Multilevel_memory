@@ -353,6 +353,13 @@ Multi-policy comparison on one fixed trace:
 python scripts/run_kv_controller_sim.py --policy-suite lru,score,belady,perfect_prefetch,bandit
 ```
 
+Offline trace replay:
+
+```bash
+python scripts/run_kv_controller_sim.py --steps 8 --save-trace-json /tmp/kv_trace.json --policy lru
+python scripts/run_kv_controller_sim.py --trace-json /tmp/kv_trace.json --policy lru
+```
+
 Commands that specifically show the stall-accounting fix and the updated
 bandit behavior:
 
@@ -360,12 +367,14 @@ bandit behavior:
 python scripts/run_kv_controller_sim.py --policy bandit --print-steps
 python scripts/run_kv_controller_sim.py --policy-suite lru,score,belady,perfect_prefetch,bandit
 python scripts/run_kv_controller_sim.py --steps 64 --policy-suite lru,score,belady,perfect_prefetch,bandit
+python scripts/run_kv_controller_sim.py --steps 64 --seed-list 0,1,2,3,4,5,6,7 --policy-suite lru,score,perfect_prefetch,bandit
 ```
 
 How to read those:
 - the first command should now show varying `stall_ms` by step rather than one flat value everywhere
 - the second command shows short-run policy comparison on the default 12-step trace
 - the third command gives the bandit enough runway to learn, which is usually a fairer adaptive-controller check
+- the fourth command is the stronger aggregate evaluation across multiple seeds
 
 CSV output:
 

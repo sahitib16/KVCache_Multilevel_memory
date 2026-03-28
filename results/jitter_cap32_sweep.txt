@@ -1,0 +1,9 @@
+[config] QUEST repo eval selection + query jitter (volatility proxy)
+[config] hbm_capacity=32, T=200, W=32, topk_pages=8, token_budget=128, chunk_size=16
+[note] total_transfer_ms includes BOTH on-demand and prefetch transfers
+
+RESULTS
+k | ond_miss | ond_ms | pre_miss | pre_ms | total_miss | total_ms
+ 0 |     2023 |  50.64 |        0 |   0.00 |       2023 |   50.64
+ 4 |     2041 |  48.04 |      224 |  13.24 |       2265 |   61.28
+ 8 |     2058 |  49.64 |       69 |   3.25 |       2127 |   52.89

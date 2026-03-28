@@ -13,6 +13,14 @@ choices while still using real per-head signals from the collected traces:
 
 3. `round_robin_interleave`
    Interleave multiple request traces so they compete for the same HBM.
+
+It also writes two combined "middle-ground" traces:
+
+4. `recent_topk_round_robin_interleave`
+   Sparsify each request with recent-topk, then interleave them.
+
+5. `recent_threshold_round_robin_interleave`
+   Sparsify each request with recent-threshold, then interleave them.
 """
 
 from __future__ import annotations
@@ -30,6 +38,8 @@ from evaluate_replay_scores import infer_trace_shape
 from kv_controller import (
     convert_trace_recent_threshold,
     convert_trace_recent_topk,
+    interleave_sparse_recent_threshold_traces,
+    interleave_sparse_recent_topk_traces,
     interleave_traces_round_robin,
     load_trace_json,
     save_trace_json,
@@ -82,10 +92,35 @@ def main() -> None:
     interleaved_path = os.path.join(args.output_dir, "round_robin_interleave.json")
     save_trace_json(interleaved_path, interleaved_trace)
 
+    # Method 4: sparsify each request with recent-topk, then interleave them.
+    topk_interleaved_trace = interleave_sparse_recent_topk_traces(
+        traces,
+        recent_block_window=args.recent_block_window,
+        top_k_older_per_layer=args.top_k_older_per_layer,
+        page_stride=args.page_stride,
+    )
+    topk_interleaved_path = os.path.join(args.output_dir, "recent_topk_round_robin_interleave.json")
+    save_trace_json(topk_interleaved_path, topk_interleaved_trace)
+
+    # Method 5: sparsify each request with recent-threshold, then interleave them.
+    threshold_interleaved_trace = interleave_sparse_recent_threshold_traces(
+        traces,
+        recent_block_window=args.recent_block_window,
+        score_mass_fraction=args.score_mass_fraction,
+        page_stride=args.page_stride,
+    )
+    threshold_interleaved_path = os.path.join(
+        args.output_dir,
+        "recent_threshold_round_robin_interleave.json",
+    )
+    save_trace_json(threshold_interleaved_path, threshold_interleaved_trace)
+
     for label, trace, path in [
         ("recent_topk", topk_trace, topk_path),
         ("recent_threshold", threshold_trace, threshold_path),
         ("round_robin_interleave", interleaved_trace, interleaved_path),
+        ("recent_topk_round_robin_interleave", topk_interleaved_trace, topk_interleaved_path),
+        ("recent_threshold_round_robin_interleave", threshold_interleaved_trace, threshold_interleaved_path),
     ]:
         steps, layers, min_required_capacity = infer_trace_shape(trace)
         print(

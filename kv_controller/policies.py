@@ -470,11 +470,11 @@ class ContextualBanditController(ResidencyController):
         alpha: float = 0.35,
         prefetch_penalty: float = 0.001,
         eviction_penalty: float = 0.001,
-        miss_penalty: float = 0.12,
-        useful_prefetch_bonus: float = 0.06,
-        wasted_prefetch_penalty: float = 0.03,
+        miss_penalty: float = 0.10,
+        useful_prefetch_bonus: float = 0.04,
+        wasted_prefetch_penalty: float = 0.015,
         miss_reduction_bonus: float = 0.02,
-        miss_increase_penalty: float = 0.04,
+        miss_increase_penalty: float = 0.02,
         bootstrap_action: BanditAction | None = None,
         bootstrap_steps: int = 2,
     ):
@@ -491,7 +491,7 @@ class ContextualBanditController(ResidencyController):
         self.bootstrap_steps = bootstrap_steps
 
         # Feature dimension is fixed by `_features`.
-        self._dim = 11
+        self._dim = 13
 
         # LinUCB keeps one linear model per action:
         #   A_a = X^T X + I
@@ -542,6 +542,8 @@ class ContextualBanditController(ResidencyController):
         - churn scaled down
         - average required-page score
         - average predicted-page score
+        - max per-layer pressure
+        - mean per-layer pressure
         - previous step stall
         - previous step demand misses
         - previous step evictions
@@ -558,6 +560,8 @@ class ContextualBanditController(ResidencyController):
         avg_predicted_score = (
             sum(_score_lookup(context, page) for page in context.predicted_pages) / max(1, len(context.predicted_pages))
         )
+        max_layer_pressure = max(context.per_layer_pressure.values(), default=0.0)
+        mean_layer_pressure = sum(context.per_layer_pressure.values()) / max(1, len(context.per_layer_pressure))
 
         return np.array(
             [
@@ -569,6 +573,8 @@ class ContextualBanditController(ResidencyController):
                 context.churn / 100.0,
                 avg_required_score,
                 avg_predicted_score,
+                max_layer_pressure,
+                mean_layer_pressure,
                 self.prev_stall_ms,
                 self.prev_demand_misses / 100.0,
                 self.prev_evictions / 100.0,
@@ -588,6 +594,8 @@ class ContextualBanditController(ResidencyController):
             "scaled_churn",
             "avg_required_score",
             "avg_predicted_score",
+            "max_layer_pressure",
+            "mean_layer_pressure",
             "prev_stall_ms",
             "prev_demand_misses",
             "prev_evictions",

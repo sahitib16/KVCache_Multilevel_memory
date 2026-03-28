@@ -25,6 +25,11 @@ Implemented now:
 - first adaptive controller (`ContextualBanditController`)
 - reusable benchmark helpers and CLI driver
 - automated tests for core invariants and policy wiring
+- real per-head signal collection from small real models through replay traces
+- pressure-inducing replay formulations:
+  - sparse single-request replay
+  - sparse+interleaved replay
+  - dense interleaved stress replay
 
 Not implemented yet:
 - real-model / real-engine-derived head-weight estimation
@@ -34,6 +39,10 @@ Not implemented yet:
 - richer benchmark reporting with stronger parity to old script experiments
 - more discriminative stall/latency model across policies
 - vLLM trace replay / shadow mode / gated live integration
+- broader real-trace collection across more prompts/models and replay-driven verification
+- replay-trace bandit retuning on the new main real benchmark
+- reuse-distance aware scoring / eviction signals
+- expanded fixed-policy family beyond LRU
 
 ## Implementation Changes
 1. Consolidate the simulator into a reusable core package.
@@ -70,12 +79,23 @@ Status:
 - Baseline B: demand-fetch only with LRU eviction.
 - Baseline C: LRU + fixed next-window prefetch.
 - Baseline D: query-aware sparse-page prefetch using current QUEST-style selector path.
+- Expanded fixed-policy family should also include:
+  - sliding-window style fixed policy
+  - score-based fixed policy
+  - fixed-k prefetch policy
 - Use one fixed-trace runner so all policies see identical workloads.
 
 Status:
 - Partially done. The new harness now has baseline controllers including LRU and score-based behavior.
 - The old script baselines still exist and remain useful as historical reference points.
 - HBM-only lower-bound parity and QUEST-style replay should still be unified into the new runner later.
+- Next extension:
+  - add more fixed policies explicitly rather than treating LRU as the only main static baseline
+  - compare them on:
+    - sequential / sliding-window traces
+    - irregular sparse traces
+    - tight-backlog regimes
+    - high-overlap regimes
 
 5. Add oracle upper bounds before more controller complexity.
 - Implement Belady-optimal eviction for the known future trace.
@@ -96,12 +116,19 @@ Status:
   - `quest_minmax_score`
   - `quest_repo_eval_score`
   - required head-weighted score `sum_h w[layer,h] * activity(layer,h,page)`
+  - reuse-distance aware hybrid score:
+    - `reuse_distance(page) = current_step - last_access_step`
+    - histogram / moving average / short-vs-long reuse classification
+    - `Score = alpha * HeadScore + beta * (1 / ReuseDistance)`
 - Use scores only to rank eviction/prefetch priority; do not change page format or kernel behavior.
 
 Status:
 - Partially done. Head-weighted scoring is now required, not optional.
 - A pluggable scorer layer exists, with passthrough and normalized head-weighted scorers.
 - QUEST/min-max/repo-eval integration into the new scorer layer is still pending.
+- Next extension:
+  - add reuse-distance-aware scoring and eviction diagnostics
+  - compare pure head score vs head+reuse hybrid score on the new main replay benchmark
 
 7. Add layer-aware budgets in the simulator.
 - Extend page identity to `(layer_id, page_id)` rather than a single flat page index.
@@ -110,6 +137,10 @@ Status:
 - Add at least two policies:
   - static equal budget
   - adaptive budget based on recent miss rate / churn / score mass
+  - stall-driven layer protection:
+    - measure which layer contributes the most stall
+    - allocate more HBM to that layer
+    - protect its pages more aggressively
 
 Status:
 - Foundation done. Page identity is already `(layer_id, page_id)`, synthetic multi-layer traces exist, and layer budgets are part of the interfaces.
@@ -124,11 +155,20 @@ Status:
   - per-layer pressure
   - transfer backlog
   - in-flight transfers
+- Additional context to keep in the controller state explicitly:
+  - churn statistics
+  - per-layer pressure metrics
+  - overlap window / overlap capacity
 - Action space:
-  - eviction rule `{LRU, score-based}`
+  - eviction rule `{LRU, sliding-window, score-based, reuse-aware hybrid}`
   - prefetch depth `{0, 2, 4, 8}`
   - layer budgeting `{off, on}`
   - compression `{off, on}` if compression exists
+- Adaptive prefetch should make `k` dynamic based on:
+  - recent miss rate
+  - transfer backlog
+  - overlap window
+  - per-layer pressure
 - Reward:
   - `-stall_ms - alpha*wasted_prefetch_bytes - beta*churn`
 - Start with epsilon-greedy LinUCB or a simple contextual Thompson variant; do not use heavy RL.
@@ -139,6 +179,10 @@ Status:
   - eviction rule `{LRU, score-based}`
   - prefetch depth `{0, 2, 4}`
 - Future expansion can add layer budgeting and compression toggles once those behaviors are implemented.
+- Next extension:
+  - retune the bandit on `recent_threshold_round_robin_interleave` as the main replay benchmark
+  - keep dense `round_robin_interleave` as the hard stress test
+  - broaden the replay-trace set before finalizing reward coefficients
 
 Implementation note for Step 4:
 - The bandit should sit above the existing static policy building blocks rather than replacing the simulator.
@@ -176,6 +220,10 @@ Current note:
 Status:
 - In progress. There is now a simulator driver, automated tests, multi-policy comparison mode, and optional step/summary CSV output.
 - A more polished benchmark harness is still pending, but the current driver is already sufficient for repeatable policy comparisons.
+- New benchmarking direction:
+  - collect a broader real-trace set
+  - build `recent_threshold_round_robin_interleave` from that larger set
+  - verify that the current pattern holds before final bandit retuning
 
 ## Test Plan
 - Unit tests for cache invariants: slot map consistency, no duplicate residency, eviction correctness, and protected needed pages not evicted within a step.

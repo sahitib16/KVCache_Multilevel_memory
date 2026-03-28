@@ -34,6 +34,8 @@ from kv_controller import (
     TransferConfig,
     convert_trace_recent_threshold,
     convert_trace_recent_topk,
+    interleave_sparse_recent_threshold_traces,
+    interleave_sparse_recent_topk_traces,
     interleave_traces_round_robin,
     load_trace_json,
     save_trace_json,
@@ -126,6 +128,7 @@ def test_simulator_context_exposes_slot_and_transfer_interfaces():
             seen["request_id"] = context.request_id
             seen["sequence_length"] = context.sequence_length
             seen["layer_block_tables"] = context.layer_block_tables
+            seen["per_layer_pressure"] = context.per_layer_pressure
             return PolicyOutput(prefetch_pages=context.predicted_pages[:1])
 
     sim = make_sim()
@@ -142,6 +145,7 @@ def test_simulator_context_exposes_slot_and_transfer_interfaces():
     assert isinstance(seen["request_id"], str)
     assert isinstance(seen["sequence_length"], int)
     assert isinstance(seen["layer_block_tables"], dict)
+    assert isinstance(seen["per_layer_pressure"], dict)
 
 
 def test_cache_slot_maps_remain_consistent_after_run():
@@ -430,3 +434,31 @@ def test_round_robin_interleave_keeps_requests_distinct_via_page_offsets():
     pages_a = set(merged[0].required_pages)
     pages_b = set(merged[1].required_pages)
     assert pages_a.isdisjoint(pages_b)
+
+
+def test_sparse_round_robin_topk_interleave_produces_smaller_required_sets():
+    trace_a = make_trace(steps=2)
+    trace_b = make_trace(steps=2)
+    merged = interleave_sparse_recent_topk_traces(
+        [trace_a, trace_b],
+        recent_block_window=1,
+        top_k_older_per_layer=1,
+        page_stride=100,
+    )
+
+    assert len(merged) == 4
+    assert len(merged[0].required_pages) <= len(trace_a[0].required_pages)
+
+
+def test_sparse_round_robin_threshold_interleave_produces_smaller_required_sets():
+    trace_a = make_trace(steps=2)
+    trace_b = make_trace(steps=2)
+    merged = interleave_sparse_recent_threshold_traces(
+        [trace_a, trace_b],
+        recent_block_window=1,
+        score_mass_fraction=0.5,
+        page_stride=100,
+    )
+
+    assert len(merged) == 4
+    assert len(merged[0].required_pages) <= len(trace_a[0].required_pages)

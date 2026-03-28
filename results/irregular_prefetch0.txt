@@ -1,0 +1,44 @@
+step 00 | misses  256 | transfer   5.29 ms | step time  15.38 ms
+step 01 | misses    1 | transfer   0.04 ms | step time   0.22 ms
+step 02 | misses    1 | transfer   0.03 ms | step time   0.13 ms
+step 03 | misses    1 | transfer   0.03 ms | step time   0.13 ms
+step 04 | misses    1 | transfer   0.03 ms | step time   0.13 ms
+step 05 | misses    1 | transfer   0.03 ms | step time   0.13 ms
+step 06 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 07 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 08 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 09 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 10 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 11 | misses    1 | transfer   0.03 ms | step time   0.13 ms
+step 12 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 13 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 14 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 15 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 16 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 17 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 18 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 19 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 20 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 21 | misses    1 | transfer   0.03 ms | step time   0.13 ms
+step 22 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 23 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 24 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 25 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 26 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 27 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 28 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 29 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 30 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 31 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 32 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 33 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 34 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 35 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 36 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 37 | misses    1 | transfer   0.03 ms | step time   0.13 ms
+step 38 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+step 39 | misses    1 | transfer   0.03 ms | step time   0.12 ms
+
+SUMMARY
+Total misses: 295
+Total transfer time: 6.38 ms

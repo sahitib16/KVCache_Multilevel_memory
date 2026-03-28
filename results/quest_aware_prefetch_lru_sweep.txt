@@ -1,0 +1,9 @@
+[config] QUEST-style TopK pages, hbm_capacity=64, T=200, W=32, topk=8
+[note] total_transfer_ms includes BOTH on-demand and prefetch transfers
+
+RESULTS
+k | ond_miss | ond_ms | pre_miss | pre_ms | total_miss | total_ms
+ 0 |      238 |   7.47 |        0 |   0.00 |        238 |    7.47
+ 4 |       40 |   0.80 |      202 |   5.39 |        242 |    6.19
+ 8 |       40 |   0.81 |      206 |   5.50 |        246 |    6.30
+16 |       40 |   0.82 |      214 |   5.73 |        254 |    6.55

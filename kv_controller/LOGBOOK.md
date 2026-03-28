@@ -1372,3 +1372,321 @@ Interpretation:
 - We now have real per-head data and a real high-pressure replay benchmark.
 - The next step is not more collection first.
 - It is tuning and comparing controllers on the interleaved real-pressure benchmark, plus building a combined sparse+interleaved replay formulation.
+
+## New Entry: Combined Sparse+Interleaved Replay Formulations
+
+What was implemented:
+- `interleave_sparse_recent_topk_traces(...)`
+- `interleave_sparse_recent_threshold_traces(...)`
+
+These are new middle-ground replay formulations:
+- first sparsify each request using real head-based scores
+- then interleave the requests so they compete for HBM
+
+Why this was needed:
+- sparse single-request replay was still too easy
+- dense round-robin interleave was very harsh
+- the combined traces should give a more realistic benchmark between those extremes
+
+Implementation files:
+- `kv_controller/trace_transforms.py`
+- `scripts/build_pressure_replays.py`
+- `kv_controller/HEAD_WEIGHTED_SCORING_WORKFLOW.md`
+
+Validation:
+- `pytest tests/test_kv_controller_core.py` -> `28 passed`
+- `python -m py_compile kv_controller/*.py scripts/build_pressure_replays.py` passed
+
+Status:
+- round-robin interleave remains the main hard benchmark
+- combined sparse+interleaved traces are now ready to evaluate before any bandit retuning
+
+## New Entry: Middle-Ground Pressure Benchmark Results
+
+Commands run:
+
+```bash
+python scripts/build_pressure_replays.py \
+  --input-traces /tmp/real_head_trace_01.json,/tmp/real_head_trace_02.json,/tmp/real_head_trace_03.json \
+  --output-dir results/pressure_replays
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/recent_topk_round_robin_interleave.json \
+  --hbm-capacity-pages 24 \
+  --policies score,bandit
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/recent_threshold_round_robin_interleave.json \
+  --hbm-capacity-pages 32 \
+  --policies score,bandit
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/round_robin_interleave.json \
+  --hbm-capacity-pages 48 \
+  --policies score,bandit
+```
+
+Observed transformed-trace capacities:
+- `recent_topk_round_robin_interleave`: `min_required_capacity = 24`
+- `recent_threshold_round_robin_interleave`: `min_required_capacity = 26`
+- `round_robin_interleave`: `min_required_capacity = 48`
+
+Observed results:
+
+1. `recent_topk_round_robin_interleave`
+- score: total miss `684`, mean stall `2.9616`, prefetch `14`, evictions `674`
+- bandit: total miss `684`, mean stall `2.9194` to `2.9362` depending on scorer, prefetch `4` to `8`, evictions `664` to `668`
+
+2. `recent_threshold_round_robin_interleave`
+- score: total miss `643`, mean stall `2.8266`, prefetch `18`, evictions `629`
+- bandit: total miss `641` to `644` depending on scorer, mean stall `2.7844` to `2.7928`, prefetch `9` to `10`, evictions `618` to `622`
+
+3. `round_robin_interleave`
+- score: total miss `992`, mean stall `4.4550`, prefetch `64`, evictions `1008`
+- bandit: total miss `1021` to `1028`, mean stall `4.5056` to `4.5141`, prefetch `39` to `43`, evictions `1016` to `1019`
+
+### Interpretation
+
+1. The new combined sparse+interleaved traces made meaningful progress.
+- Unlike the earlier single-request sparse traces, these now create hundreds of evictions.
+- Unlike the dense interleaved trace, they are not overwhelmingly harsh.
+- This means they successfully created the intended middle-ground benchmark.
+
+2. `recent_threshold_round_robin_interleave` is currently the best benchmark of the three.
+- It is clearly harder than single-request sparse replay.
+- But easier and more discriminating than the dense interleaved benchmark.
+- Bandit is slightly better than score-based on mean stall.
+- Bandit is roughly tied or slightly better on misses, depending on scorer.
+
+3. `recent_topk_round_robin_interleave` also works, but is slightly weaker.
+- Score and bandit tie on total misses.
+- Bandit still improves mean stall a bit.
+- So it is useful, but less informative than the threshold-interleaved version.
+
+4. Dense `round_robin_interleave` is still valuable, but maybe too harsh as the main tuning target.
+- It creates the strongest pressure.
+- But in that regime the current bandit loses clearly to score-based control.
+- This suggests it is a good stress test, but not necessarily the best first retuning benchmark.
+
+5. The threshold-interleaved trace is the first replay regime that looks like a good "mainline" tuning benchmark.
+- controller choices matter
+- pressure is real
+- the bandit is not collapsing
+- the score-based baseline does not dominate completely
+
+### Conclusion
+
+- Yes, this is meaningful progress.
+- The project now has:
+  - easy sparse replay
+  - middle-ground sparse+interleaved replay
+  - hard dense-interleaved replay
+- The best next benchmark for controller work is `recent_threshold_round_robin_interleave`.
+
+## New Entry: Broader-Tuned Bandit Defaults And Head-Plan Status
+
+What was changed:
+- bandit default reward coefficients updated to the broader-tuned values:
+  - `miss_penalty = 0.10`
+  - `useful_prefetch_bonus = 0.04`
+  - `wasted_prefetch_penalty = 0.015`
+  - `miss_reduction_bonus = 0.02`
+  - `miss_increase_penalty = 0.02`
+- explicit `per_layer_pressure` was added to `ControllerContext`
+- the bandit's feature vector now includes:
+  - `max_layer_pressure`
+  - `mean_layer_pressure`
+
+Validation:
+- `pytest tests/test_kv_controller_core.py` -> `28 passed`
+- `python -m py_compile kv_controller/*.py` passed
+
+### Post-update comparison results
+
+1. Main benchmark: `recent_threshold_round_robin_interleave`
+
+score baseline:
+- total miss `2181`
+- mean stall `3.0505`
+- p95 stall `3.7800`
+- prefetch `56`
+- evictions `2213`
+
+bandit after default update:
+- passthrough/recomputed:
+  - total miss `2182`
+  - mean stall `3.0024`
+  - p95 stall `3.5100`
+  - prefetch `23`
+  - evictions `2177`
+- layer_normalized:
+  - total miss `2181`
+  - mean stall `3.0073`
+  - p95 stall `3.5100`
+  - prefetch `25`
+  - evictions `2177`
+
+Interpretation:
+- the bandit now clearly beats or ties `score` on the main benchmark
+- it achieves lower mean stall
+- it achieves lower p95 stall
+- it does so with far fewer prefetches and fewer evictions
+- the best current main-benchmark scorer view is now effectively `layer_normalized`, because it ties misses and still lowers stall
+
+2. Hard stress test: `round_robin_interleave`
+
+score baseline:
+- total miss `3258`
+- mean stall `4.6494`
+- p95 stall `11.3400`
+- prefetch `186`
+- evictions `3366`
+
+bandit after default update:
+- passthrough/recomputed:
+  - total miss `3295`
+  - mean stall `4.6035`
+  - p95 stall `11.0700`
+  - prefetch `149`
+- layer_normalized:
+  - total miss `3280`
+  - mean stall `4.5900`
+  - p95 stall `11.0700`
+  - prefetch `164`
+
+Interpretation:
+- the bandit still loses on misses in the hardest regime
+- but it improves mean stall and p95 stall
+- and the miss gap is smaller than before under the better scorer views
+- `layer_normalized` is again the strongest scorer view for the bandit
+
+### Overall interpretation
+
+- the broader-tuned defaults were a good update
+- the bandit is now in a healthier state:
+  - strong on the main benchmark
+  - competitive but not yet dominant on the hard stress test
+- reward tuning helped, but did not fully solve the hardest regime
+- that suggests the next bottleneck is no longer just reward coefficients
+- the next likely bottlenecks are:
+  - action menu
+  - controller features
+  - static policy family
+
+### Head-weighted scoring plan status
+
+Completed:
+- Step 1: define and preserve raw head signal
+- Step 2: replay as the main experiment interface
+- Step 3: score adapters
+- Step 5: move from synthetic to replayed traces
+- Step 6 (first half): collect real head signals from a real model
+
+Partially completed:
+- Step 4: diagnostics
+  - we have useful policy/benchmark diagnostics
+  - we can still add deeper score-rank correlation and score-distribution views
+- Step 7: evaluate score quality by control value
+  - this is actively happening now through sparse, interleaved, and broader replay benchmarks
+
+Not started yet:
+- Step 8: train a predictor later if needed
+
+Practical status summary:
+- the head-based scoring plan is mostly through its core data-pipeline and replay-evaluation stages
+- the main missing work is:
+  - broader validation
+  - better diagnostics
+  - deciding whether a learned predictor is necessary at all
+
+### Conclusion
+
+- yes, it was worth updating the bandit defaults before moving on
+- yes, adding churn/per-layer pressure context was easy and is now done
+- the head-weighted scoring plan should be finished first before moving deeply into reuse-distance and other novelty features
+- the remaining head-plan work is now mostly about validation and diagnostics, not basic infrastructure
+
+## New Entry: Public-Dataset Validation And Diagnostics
+
+What was implemented:
+- `scripts/collect_dataset_head_traces.py`
+  - collects replay traces from public prompt datasets
+  - current adapters:
+    - `HuggingFaceH4/mt_bench_prompts`
+    - `OpenAssistant/oasst1`
+- `kv_controller/score_diagnostics.py`
+- `scripts/diagnose_replay_scores.py`
+- diagnostics bug fix:
+  - next-step reuse is now measured against the next step of the *same request* instead of the next global step, which matters for interleaved traces
+
+Validation:
+- `pytest tests/test_kv_controller_core.py` -> `28 passed`
+- `python -m py_compile kv_controller/*.py scripts/diagnose_replay_scores.py scripts/collect_dataset_head_traces.py` passed
+
+### Public-dataset trace collection
+
+MT-Bench slice:
+- `4` prompts collected successfully
+- example min feasible capacities: `36`, `48`, `60`, `48`
+
+OpenAssistant slice:
+- `4` prompts collected successfully
+- example min feasible capacities: `24`, `48`, `24`, `24`
+
+### Dataset-backed main benchmark
+
+`recent_threshold_round_robin_interleave`
+
+score:
+- total miss `2158`
+- mean stall `3.1163`
+- p95 stall `3.5100`
+- prefetch `39`
+- evictions `2165`
+
+bandit:
+- normalized scorer:
+  - total miss `2158`
+  - mean stall `3.0938`
+  - p95 stall `3.5100`
+  - prefetch `20`
+  - evictions `2146`
+- layer_normalized scorer:
+  - total miss `2158`
+  - mean stall `3.1078`
+  - p95 stall `3.5100`
+  - prefetch `35`
+  - evictions `2161`
+
+### Interpretation of dataset-backed benchmark
+
+- the public-dataset results confirm the main pattern:
+  - bandit can match score-based misses while reducing mean stall
+  - and it does so with less prefetch/eviction pressure
+- however, unlike the earlier broader prompt benchmark, `normalized` slightly beats `layer_normalized` on this dataset slice
+- therefore we should *not* lock `layer_normalized` as the universal default scorer yet
+
+### Diagnostics on the dataset-backed traces
+
+- all scorers show extremely high top-k next-step hit rates
+- reused-page mean rank is very similar across scorer variants
+- `layer_normalized` is slightly better on reused-page rank, but only by a small margin
+
+### Interpretation of diagnostics
+
+- the current pressure replay formulation still makes next-step relevance very easy for all scorers
+- diagnostics are now correct, but they are somewhat saturated
+- this means:
+  - we do have enough data to validate the current analytic scorer family
+  - but we do *not* yet have evidence that a learned predictor is needed
+  - scorer differences are still relatively small and mostly show up in control outcomes rather than raw reuse diagnostics
+
+### Decision
+
+- collect more real data only in a targeted way
+- not because the pipeline is missing data entirely, but because scorer ranking is still close and benchmark conclusions may depend on prompt source
+- do not jump to a learned predictor yet
+- first finish the head-weighted scoring plan with:
+  - broader validation
+  - stronger diagnostics
+  - scorer-default decision

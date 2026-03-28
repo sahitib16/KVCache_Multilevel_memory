@@ -171,22 +171,29 @@ Completed so far:
 - Step 1 is done:
   - replay traces now preserve `per_page_head_activity`
   - `WorkloadStep` carries both raw head activity and aggregate scores
-- Step 2 is effectively in progress and working:
+- Step 2 is effectively done and working:
   - replay traces can be saved and reloaded
   - alternate replay-time scorers can now be applied to the same trace
-- Step 3 has started:
+- Step 3 is effectively done for the first scorer family:
   - multiple score adapters exist
   - replay-time scorer comparisons are now possible
+- Step 4 is now in progress:
+  - diagnostics script exists for score distributions and next-step hit rates
+- Step 6 is in progress:
+  - real head-summary traces can now be collected from:
+    - manually supplied prompts
+    - public prompt datasets through the dataset collector
 
 Current replay-time default:
-- scorer view: `HeadActivityRecomputedScorer`
-  - on synthetic traces this matches the original aggregate score exactly
-  - it is preferred over raw passthrough conceptually because it depends on the
-    primitive replay-preserved signal rather than trusting a pre-baked score
+- scorer view: `LayerNormalizedHeadActivityScorer` for the current main replay benchmark
+  - broader real-benchmark comparisons now show this is the strongest current
+    scorer view for the bandit on both the main benchmark and the hard stress test
 - bandit action menu: `full`
   - broader replay studies favored the full menu over the trimmed menu
 
 Next:
-- broaden replay-time scorer studies further when helpful
-- make the replay/logging schema more vLLM-shaped
-- define and collect the first real head-summary traces from a manageable model
+- broaden replay-time scorer studies further using public prompt datasets
+- run diagnostics on those broader traces and confirm whether
+  `layer_normalized` remains the best main scorer view
+- decide whether the direct analytic scorer is strong enough or whether a
+  learned predictor is needed later

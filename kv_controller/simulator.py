@@ -46,6 +46,17 @@ class OverlapAwareSimulator:
 
     def _make_context(self, step: WorkloadStep) -> ControllerContext:
         """Build the read-only snapshot the controller sees for this step."""
+        required_by_layer: dict[int, int] = {}
+        for page in step.required_pages:
+            required_by_layer[page.layer_id] = required_by_layer.get(page.layer_id, 0) + 1
+
+        per_layer_pressure: dict[int, float] = {}
+        visible_layers = set(step.referenced_layers) | set(required_by_layer) | set(self.state.layer_budgets)
+        for layer_id in visible_layers:
+            budget = self.state.layer_budgets.get(layer_id)
+            allowed_pages = budget.max_resident_pages if budget is not None else self.config.cache.hbm_capacity_pages
+            per_layer_pressure[layer_id] = required_by_layer.get(layer_id, 0) / max(1, allowed_pages)
+
         return ControllerContext(
             step_idx=step.step_idx,
             required_pages=step.required_pages,
@@ -58,6 +69,7 @@ class OverlapAwareSimulator:
             miss_rate=self.state.miss_rate(),
             churn=self.state.churn,
             per_layer_occupancy=dict(self.state.per_layer_occupancy),
+            per_layer_pressure=per_layer_pressure,
             head_weighted_scores=step.head_weighted_scores,
             per_page_head_activity=step.per_page_head_activity,
             per_page_features=step.per_page_features,

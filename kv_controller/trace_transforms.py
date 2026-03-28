@@ -21,6 +21,8 @@ The current transformations are:
 - round-robin interleave:
   combine several traces from different requests into one replay stream while
   remapping page ids so requests do not collide
+- sparse + round-robin interleave:
+  sparsify each request first, then interleave the requests
 """
 
 from dataclasses import replace
@@ -241,3 +243,51 @@ def interleave_traces_round_robin(
                 merged.append(trace[local_step])
 
     return [replace(step, step_idx=index) for index, step in enumerate(merged)]
+
+
+def interleave_sparse_recent_topk_traces(
+    traces: list[list[WorkloadStep]],
+    *,
+    recent_block_window: int = 1,
+    top_k_older_per_layer: int = 1,
+    page_stride: int = 1000,
+) -> list[WorkloadStep]:
+    """Combine two ideas: sparsify each request, then interleave requests.
+
+    Why this helps:
+    - sparse single-request replay was still too easy
+    - dense round-robin replay is quite harsh
+    - this combined transform gives us a middle ground where requests compete
+      with each other, but each request only demands its most relevant old
+      blocks rather than the full dense prefix
+    """
+
+    sparse_traces = [
+        convert_trace_recent_topk(
+            trace,
+            recent_block_window=recent_block_window,
+            top_k_older_per_layer=top_k_older_per_layer,
+        )
+        for trace in traces
+    ]
+    return interleave_traces_round_robin(sparse_traces, page_stride=page_stride)
+
+
+def interleave_sparse_recent_threshold_traces(
+    traces: list[list[WorkloadStep]],
+    *,
+    recent_block_window: int = 1,
+    score_mass_fraction: float = 0.5,
+    page_stride: int = 1000,
+) -> list[WorkloadStep]:
+    """Sparsify each request by score mass, then interleave requests."""
+
+    sparse_traces = [
+        convert_trace_recent_threshold(
+            trace,
+            recent_block_window=recent_block_window,
+            score_mass_fraction=score_mass_fraction,
+        )
+        for trace in traces
+    ]
+    return interleave_traces_round_robin(sparse_traces, page_stride=page_stride)

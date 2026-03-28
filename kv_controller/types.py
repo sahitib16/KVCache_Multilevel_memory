@@ -221,6 +221,7 @@ class ControllerContext:
     miss_rate: float
     churn: int
     per_layer_occupancy: dict[int, int]
+    per_layer_pressure: dict[int, float]
     head_weighted_scores: dict[KVPageId, float]
     per_page_head_activity: dict[KVPageId, tuple[float, ...]]
     per_page_features: dict[KVPageId, dict[str, float]]

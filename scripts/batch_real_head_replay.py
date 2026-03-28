@@ -70,6 +70,24 @@ PROMPT_PRESETS = {
         "The controller should learn which pages to keep hot, which to evict, and "
         "which to prefetch before the next decode step begins."
     ),
+    "scientific": (
+        "A caching controller for transformer inference should reason about memory "
+        "movement, overlap, and page reuse under bandwidth constraints."
+    ),
+    "dialogue": (
+        "User: Why is inference slow when KV spills to CPU?\n"
+        "Assistant: Because transfer latency dominates when the needed blocks are not already resident."
+    ),
+    "procedural": (
+        "First identify the active pages, then decide which pages to evict, then "
+        "prefetch the most useful future pages before the next decode step."
+    ),
+    "code": (
+        "def schedule(prefetch_k, backlog, miss_rate):\n"
+        "    if backlog > 4:\n"
+        "        return 0\n"
+        "    return prefetch_k\n"
+    ),
 }
 
 

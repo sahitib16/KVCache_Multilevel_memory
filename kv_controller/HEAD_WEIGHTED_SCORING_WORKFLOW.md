@@ -251,6 +251,16 @@ This script builds three harder replay formulations from the collected real trac
 3. `round_robin_interleave`
 - interleave multiple requests so they compete for the same HBM space
 
+It also writes two combined middle-ground traces:
+
+4. `recent_topk_round_robin_interleave`
+- sparsify each request with recent-topk first
+- then interleave requests so they compete for HBM
+
+5. `recent_threshold_round_robin_interleave`
+- sparsify each request with recent-threshold first
+- then interleave requests so they compete for HBM
+
 ### Build the three pressure traces
 
 ```bash
@@ -288,6 +298,24 @@ python scripts/evaluate_replay_scores.py \
   --policies score,bandit
 ```
 
+### Evaluate `recent_topk_round_robin_interleave`
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/recent_topk_round_robin_interleave.json \
+  --hbm-capacity-pages 24 \
+  --policies score,bandit
+```
+
+### Evaluate `recent_threshold_round_robin_interleave`
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/recent_threshold_round_robin_interleave.json \
+  --hbm-capacity-pages 24 \
+  --policies score,bandit
+```
+
 ### Build a harsher sparse version
 
 ```bash
@@ -297,4 +325,141 @@ python scripts/build_pressure_replays.py \
   --top-k-older-per-layer 1 \
   --score-mass-fraction 0.35 \
   --output-dir results/pressure_replays_harsh
+```
+
+## Broader Main Benchmark
+
+The repo now also includes:
+
+[`build_broader_real_benchmark.py`](/home/sbulusu31/kv_multilevel/scripts/build_broader_real_benchmark.py)
+
+This script:
+- collects a broader real-trace set from more prompt styles
+- saves the raw traces
+- builds `recent_threshold_round_robin_interleave` as the main benchmark
+- also builds dense `round_robin_interleave` as the hard stress test
+
+### Build the broader benchmark set
+
+```bash
+python scripts/build_broader_real_benchmark.py \
+  --output-dir results/broader_real_benchmark
+```
+
+### Evaluate the broader main benchmark
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/broader_real_benchmark/benchmarks/recent_threshold_round_robin_interleave.json \
+  --hbm-capacity-pages 32 \
+  --policies score,bandit
+```
+
+### Evaluate the broader dense stress trace
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/broader_real_benchmark/benchmarks/round_robin_interleave.json \
+  --hbm-capacity-pages 48 \
+  --policies score,bandit
+```
+
+## Replay-Side Bandit Tuning
+
+The repo now also includes:
+
+[`tune_bandit_replay.py`](/home/sbulusu31/kv_multilevel/scripts/tune_bandit_replay.py)
+
+This script sweeps bandit reward coefficients directly on replay traces instead
+of synthetic traces.
+
+### Tune on the broader main benchmark
+
+```bash
+python scripts/tune_bandit_replay.py \
+  --trace-jsons results/broader_real_benchmark/benchmarks/recent_threshold_round_robin_interleave.json \
+  --capacity 32 \
+  --bandit-menu full
+```
+
+### Tune on both the main benchmark and the hard stress test
+
+```bash
+python scripts/tune_bandit_replay.py \
+  --trace-jsons results/broader_real_benchmark/benchmarks/recent_threshold_round_robin_interleave.json,results/broader_real_benchmark/benchmarks/round_robin_interleave.json \
+  --capacity min \
+  --bandit-menu full
+```
+
+## Public Dataset Validation
+
+The repo now also includes:
+
+[`collect_dataset_head_traces.py`](/home/sbulusu31/kv_multilevel/scripts/collect_dataset_head_traces.py)
+
+This script collects real head-summary traces from public prompt datasets.
+
+Current dataset adapters:
+- `HuggingFaceH4/mt_bench_prompts`
+- `OpenAssistant/oasst1`
+
+### Collect a small MT-Bench slice
+
+```bash
+python scripts/collect_dataset_head_traces.py \
+  --dataset mt_bench \
+  --split train \
+  --count 4 \
+  --model gpt2 \
+  --max-new-tokens 12 \
+  --kv-block-size-tokens 16 \
+  --output-dir results/dataset_head_traces/mt_bench
+```
+
+### Collect a small OpenAssistant slice
+
+```bash
+python scripts/collect_dataset_head_traces.py \
+  --dataset oasst1 \
+  --split validation \
+  --count 4 \
+  --model gpt2 \
+  --max-new-tokens 12 \
+  --kv-block-size-tokens 16 \
+  --output-dir results/dataset_head_traces/oasst1
+```
+
+### Build a pressure benchmark from the collected dataset traces
+
+```bash
+python scripts/build_pressure_replays.py \
+  --input-traces results/dataset_head_traces/mt_bench/mt_bench_writing_0.json,results/dataset_head_traces/mt_bench/mt_bench_writing_1.json,results/dataset_head_traces/mt_bench/mt_bench_writing_2.json,results/dataset_head_traces/mt_bench/mt_bench_writing_3.json,results/dataset_head_traces/oasst1/oasst1_0.json,results/dataset_head_traces/oasst1/oasst1_1.json,results/dataset_head_traces/oasst1/oasst1_2.json,results/dataset_head_traces/oasst1/oasst1_3.json \
+  --output-dir results/dataset_head_traces/pressure
+```
+
+### Evaluate the dataset-backed main benchmark
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/dataset_head_traces/pressure/recent_threshold_round_robin_interleave.json \
+  --hbm-capacity-pages 32 \
+  --policies score,bandit
+```
+
+## Score Diagnostics
+
+The repo now also includes:
+
+[`diagnose_replay_scores.py`](/home/sbulusu31/kv_multilevel/scripts/diagnose_replay_scores.py)
+
+This script reports:
+- score distribution statistics
+- top-k next-step hit rates
+- reused-page rank summary
+
+### Run diagnostics on the dataset-backed benchmarks
+
+```bash
+python scripts/diagnose_replay_scores.py \
+  --trace-jsons results/dataset_head_traces/pressure/recent_threshold_round_robin_interleave.json,results/dataset_head_traces/pressure/round_robin_interleave.json
 ```

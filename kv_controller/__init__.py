@@ -52,12 +52,15 @@ from .scoring import (
     PredictedBoostedHeadActivityScorer,
     apply_scorer_to_trace,
 )
+from .score_diagnostics import diagnose_trace_scores
 from .scheduler import OverlapTransferScheduler
 from .simulator import OverlapAwareSimulator
 from .state import CacheState
 from .trace_transforms import (
     convert_trace_recent_threshold,
     convert_trace_recent_topk,
+    interleave_sparse_recent_threshold_traces,
+    interleave_sparse_recent_topk_traces,
     interleave_traces_round_robin,
 )
 from .types import (
@@ -93,6 +96,7 @@ __all__ = [
     "ContextualBanditController",
     "convert_trace_recent_threshold",
     "convert_trace_recent_topk",
+    "diagnose_trace_scores",
     "FutureTraceOracle",
     "HeadWeightedScorer",
     "HeadActivityRecomputedScorer",
@@ -115,6 +119,8 @@ __all__ = [
     "ScoreBasedController",
     "apply_scorer_to_trace",
     "interleave_traces_round_robin",
+    "interleave_sparse_recent_threshold_traces",
+    "interleave_sparse_recent_topk_traces",
     "save_trace_json",
     "SimulationConfig",
     "StepMetrics",

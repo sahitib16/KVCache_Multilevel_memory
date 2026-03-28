@@ -1,0 +1,9 @@
+[config] hbm_capacity=64, T=200, W=32, num_sparse=8
+[note] total_transfer_ms includes BOTH on-demand and prefetch transfers
+
+RESULTS
+k | ond_miss | ond_ms | pre_miss | pre_ms | total_miss | total_ms
+ 0 |     1802 |  38.82 |        0 |   0.00 |       1802 |   38.82
+ 4 |     1610 |  32.99 |      200 |   5.30 |       1810 |   38.29
+ 8 |     1620 |  33.63 |      204 |   5.35 |       1824 |   38.98
+16 |     1606 |  33.10 |      214 |   5.68 |       1820 |   38.78

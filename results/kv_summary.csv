@@ -1,0 +1,6 @@
+bandit_last_action,bandit_steps_observed,bandit_total_reward,final_backlog,final_inflight_transfers,final_queued_transfers,final_resident_pages,final_slot_map_size,hbm_format,mean_demand_misses,mean_stall_ms,p95_stall_ms,p99_stall_ms,policy,steps,total_compute_ms,total_demand_misses,total_evictions,total_prefetches_submitted,total_stall_ms
+,,,0,0,0,20,20,uniform,4.666666666666667,0.2699999999999997,0.27,0.27,lru,12,0.6000000000000001,56,47,11,3.2399999999999967
+,,,0,0,0,20,20,uniform,4.75,0.2699999999999997,0.27,0.27,score,12,0.6000000000000001,57,46,9,3.2399999999999967
+,,,0,0,0,20,20,uniform,4.0,0.27,0.27000000000000046,0.27000000000000046,belady,12,0.6000000000000001,48,28,0,3.24
+,,,0,0,0,20,20,uniform,4.333333333333333,0.26999999999999974,0.27,0.27,perfect_prefetch,12,0.6000000000000001,52,43,11,3.2399999999999967
+"BanditAction(eviction_rule='score', prefetch_k=2)",12,-4.7499999999999964,0,0,0,20,20,uniform,4.916666666666667,0.2699999999999997,0.27,0.27,bandit,12,0.6000000000000001,59,48,9,3.2399999999999967

@@ -1,0 +1,9 @@
+[config] QUEST repo eval selection (local_heavy_hitter_mask) -> pages
+[config] hbm_capacity=64, T=200, W=32, topk_pages=8, token_budget=128, chunk_size=16
+[note] total_transfer_ms includes BOTH on-demand and prefetch transfers
+
+RESULTS
+k | ond_miss | ond_ms | pre_miss | pre_ms | total_miss | total_ms
+ 0 |      239 |  15.46 |        0 |   0.00 |        239 |   15.46
+ 4 |      235 |  18.79 |        4 |   0.16 |        239 |   18.94
+ 8 |      231 |  16.80 |        8 |   0.20 |        239 |   17.00

@@ -652,3 +652,723 @@ They show:
 Because the summaries match exactly, the replay layer is behaving correctly.
 That matters because future scoring experiments can now run against a fixed
 replayed trace rather than regenerated synthetic data.
+
+## New Entry: Replay Score Tuning And Action-Menu Comparison
+
+This round focused on:
+- using replayed traces to compare score variants directly
+- comparing a small set of bandit action menus against those score variants
+- deciding whether the trimmed menu should remain the default experimental menu
+
+### Changes made
+
+1. Added new score variants in
+   [`scoring.py`](/home/sbulusu31/kv_multilevel/kv_controller/scoring.py)
+
+New scorers:
+- `HeadActivityRecomputedScorer`
+- `LayerNormalizedHeadActivityScorer`
+- `PredictedBoostedHeadActivityScorer`
+- `apply_scorer_to_trace(...)`
+
+Why:
+- we want replay traces to support alternate score functions without changing
+  the trace itself
+
+2. Added replay score evaluation script in
+   [`evaluate_replay_scores.py`](/home/sbulusu31/kv_multilevel/scripts/evaluate_replay_scores.py)
+
+This script can now:
+- compare scorers on one replayed trace
+- compare scorers across multiple seeds
+- compare multiple bandit action menus against those scorers
+
+3. Added named bandit action-menu presets in
+   [`policies.py`](/home/sbulusu31/kv_multilevel/kv_controller/policies.py)
+
+Current presets:
+- `full`
+- `trimmed`
+- `score_heavy`
+
+### Multi-seed replay results
+
+Using seeds `0,1,2,3,4`, policies `score,bandit`, and menus
+`full, trimmed, score_heavy`, the replay scorer comparison showed:
+
+#### Passthrough scorer
+
+```text
+full        bandit avg_miss 271.60   avg_mean_stall 0.7180
+trimmed     bandit avg_miss 269.40   avg_mean_stall 0.7282
+score_heavy bandit avg_miss 272.00   avg_mean_stall 0.7197
+```
+
+Interpretation:
+- `full` and `score_heavy` are more aggressive on stall
+- `trimmed` gives up some stall but improves misses
+
+#### Normalized scorer
+
+```text
+full        bandit avg_miss 266.00   avg_mean_stall 0.7214
+trimmed     bandit avg_miss 267.00   avg_mean_stall 0.7256
+score_heavy bandit avg_miss 268.80   avg_mean_stall 0.7229
+```
+
+Interpretation:
+- this was the best overall replay result in the comparison
+- `full + normalized` beats the score baseline on both misses and stall
+- this is the strongest sign so far that score realism matters materially
+
+#### Layer-normalized scorer
+
+```text
+full        bandit avg_miss 273.80   avg_mean_stall 0.7189
+trimmed     bandit avg_miss 273.20   avg_mean_stall 0.7383
+score_heavy bandit avg_miss 274.80   avg_mean_stall 0.7223
+```
+
+Interpretation:
+- layer normalization did not help in this replay study
+- it pushed the bandit toward lower stall but significantly worse misses
+
+#### Predicted-boosted scorer
+
+```text
+full        bandit avg_miss 274.80   avg_mean_stall 0.7256
+trimmed     bandit avg_miss 268.80   avg_mean_stall 0.7223
+score_heavy bandit avg_miss 271.60   avg_mean_stall 0.7256
+```
+
+Interpretation:
+- naive prediction boosting is not clearly beneficial yet
+- it likely needs more careful shaping before it becomes a good default score
+
+### Menu decision
+
+Conclusion from the replay evidence:
+- the trimmed menu does **not** clearly dominate
+- the `full` menu paired with the `normalized` scorer gave the best overall
+  miss/stall balance in this study
+- the `trimmed` menu is still useful as a simpler comparison point, but it
+  should not be treated as the final answer yet
+
+So the current decision is:
+- keep named menus for experimentation
+- do not lock the project to `trimmed` as the only preferred menu
+- prioritize replay-driven scorer/menu combinations rather than pruning the
+  action space too aggressively
+
+### What this means for head-weighted importance progress
+
+Done:
+- raw per-page head activity is preserved in traces and replay files
+- replay-based alternate scorers now exist
+- replay-based scorer comparison now exists
+
+Next:
+- promote the strongest replay scorer candidates into broader aggregate studies
+- decide whether `normalized` should become the main replay-time score view
+- only after that move toward real collected head summaries from model runs
+
+## New Entry: Broader Replay Aggregate And Default Lock-In
+
+This round answered two questions:
+- does the best replay scorer/menu combination hold up beyond 5 seeds?
+- should the trimmed menu remain the preferred replay-time menu?
+
+### Broader replay results
+
+8-seed replay aggregate comparing `full` vs `trimmed` menus:
+
+```text
+passthrough + full        bandit avg_miss 270.50   avg_mean_stall 0.7235
+passthrough + trimmed     bandit avg_miss 268.25   avg_mean_stall 0.7330
+
+normalized + full         bandit avg_miss 267.88   avg_mean_stall 0.7283
+normalized + trimmed      bandit avg_miss 267.88   avg_mean_stall 0.7320
+
+recomputed + full         bandit avg_miss 270.50   avg_mean_stall 0.7235
+recomputed + trimmed      bandit avg_miss 268.25   avg_mean_stall 0.7330
+```
+
+12-seed replay aggregate using the strongest menu candidate (`full`):
+
+```text
+passthrough + full        bandit avg_miss 267.25   avg_mean_stall 0.7225
+normalized + full         bandit avg_miss 267.92   avg_mean_stall 0.7249
+recomputed + full         bandit avg_miss 267.25   avg_mean_stall 0.7225
+layer_normalized + full   bandit avg_miss 270.00   avg_mean_stall 0.7214
+predicted_boosted + full  bandit avg_miss 269.92   avg_mean_stall 0.7246
+```
+
+### Interpretation
+
+- The trimmed menu does not win the broader replay study.
+- `full` consistently gives better mean stall than `trimmed`.
+- `normalized + full` looked strongest in the smaller 5-seed comparison, but
+  the broader 12-seed replay study favored `passthrough/recomputed + full`.
+- On synthetic traces, `passthrough` and `recomputed` are identical because the
+  original synthetic score is already built from the stored head activity.
+- Between those two, `recomputed` is the better conceptual default because it
+  depends on the primitive replay-preserved signal rather than trusting a
+  pre-baked aggregate score.
+
+### Decision
+
+Replay-time defaults are now treated as:
+- scorer: `HeadActivityRecomputedScorer`
+- bandit menu: `full`
+
+This does not mean the search is over, but it gives the project one clear
+default replay configuration before moving further down the head-importance
+pipeline.
+
+## New Entry: First Real Head-Trace Collection Attempt
+
+This round was the first end-to-end attempt to:
+- collect a replay trace from a real model
+- feed it back through the simulator and controller
+
+### What was done
+
+Real trace collection command:
+
+```bash
+python scripts/collect_real_head_traces.py \
+  --model gpt2 \
+  --prompt "The quick brown fox jumps over the lazy dog." \
+  --max-new-tokens 8 \
+  --kv-block-size-tokens 16 \
+  --output-json /tmp/real_head_trace.json
+```
+
+This succeeded and wrote a replay file.
+
+Then replay evaluation was attempted with:
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json /tmp/real_head_trace.json \
+  --policies score,bandit
+```
+
+This failed with:
+
+```text
+RuntimeError: No free HBM slot available when reserving transfer.
+```
+
+Model-library APIs used in this first collector:
+- `transformers.AutoTokenizer.from_pretrained(...)`
+- `transformers.AutoModelForCausalLM.from_pretrained(..., attn_implementation="eager")`
+- model forward pass with:
+  - `output_attentions=True`
+  - `use_cache=False`
+- next-token selection from `outputs.logits[:, -1, :]` via greedy `argmax`
+
+Attention extraction path:
+- read `outputs.attentions`
+- take the newest query token's attention distribution from each layer/head
+- bucket token positions into KV blocks
+- sum attention mass per block to form `per_page_head_activity`
+- compute per-layer head weights from a head-concentration proxy
+- combine them into `head_weighted_scores`
+
+### What this error means
+
+This is not a parser bug and not a scorer bug.
+It means the current simulator configuration did not have enough HBM capacity
+to hold the real trace's required KV working set.
+
+In this case:
+- GPT-2 has 12 layers
+- with `kv_block_size_tokens = 16`, once the sequence grows beyond 16 tokens,
+  each layer needs 2 KV blocks/pages instead of 1
+- that means the required set can reach roughly:
+  - `12 layers * 2 blocks = 24 required pages`
+- the simulator default HBM capacity used by the replay evaluator was only
+  `20 pages`
+
+So the simulator was being asked to launch a decode step whose required set was
+larger than total available HBM slots.
+
+That is why it failed during transfer reservation.
+
+### Why this is still useful
+
+This was actually a good validation point:
+- the real trace path is working
+- the replay file is valid enough to reach the simulator
+- the simulator is enforcing a real capacity invariant instead of silently
+  producing nonsense
+
+### Immediate implication
+
+Real-trace replay should be run with a capacity that can accommodate the
+required working set for the chosen model / block size / sequence length.
+
+For the GPT-2 example, a safer next run is something like:
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json /tmp/real_head_trace.json \
+  --hbm-capacity-pages 32 \
+  --policies score,bandit
+```
+
+### Follow-up fix and successful replay
+
+After increasing HBM capacity, a second issue appeared:
+
+```text
+KeyError: 4
+```
+
+What that meant:
+- the replay evaluator was still building the simulator using the CLI default
+  layer count (`2`)
+- but the real GPT-2 trace contains `12` layers
+- that caused the controller's layer-budget logic to see pages from layers not
+  present in the simulator's configured budget table
+
+Fix applied:
+- the replay evaluator now infers layer count and step count directly from the
+  loaded trace
+- it also reports a clearer error if HBM capacity is below the trace's minimum
+  required working-set size
+
+Internal capacity check for the GPT-2 trace showed:
+
+```text
+steps: 8
+layers: 12
+max_required_pages_per_step: 24
+required_pages_per_step: [12, 12, 12, 12, 12, 12, 12, 24]
+```
+
+So a capacity of at least `24` pages is required just to make residency
+possible. Using `32` pages is a safe first replay setting.
+
+Successful replay command:
+
+```bash
+python scripts/evaluate_replay_scores.py \
+  --trace-json /tmp/real_head_trace.json \
+  --hbm-capacity-pages 32 \
+  --policies score,bandit
+```
+
+Observed result:
+
+```text
+SCORER: passthrough | bandit_menu=full
+score   total_miss 22   mean_stall 0.4050   p95 1.6200   prefetch 2   evictions 0
+bandit  total_miss 22   mean_stall 0.4050   p95 1.6200   prefetch 2   evictions 0
+```
+
+Other scorer variants were almost identical, with only a tiny change for
+`layer_normalized`.
+
+### Interpretation of the first successful real replay
+
+- This first real trace is valid, but it is not yet stressful enough to
+  separate controller quality.
+- There are no evictions and almost no prefetch activity.
+- That means the controller is not yet operating in the high-pressure regime
+  where scorer or policy differences can show up strongly.
+
+So this is a data-pipeline success, not yet a meaningful controller benchmark.
+
+The next real-trace collection runs should increase pressure by changing one or
+more of:
+- longer prompts
+- more decode steps
+- smaller KV block size
+- tighter HBM capacity during replay
+
+### Framework-level vs kernel-level note
+
+The current collector uses framework-level signals:
+- model forward pass in `transformers`
+- `output_attentions=True`
+- attention tensors captured in Python / framework space
+
+This is different from kernel-level collection:
+- framework-level means we read logical attention outputs from the model API
+- kernel-level would mean instrumenting or reading behavior much closer to the
+  fused attention implementation itself
+
+Why we started at framework level:
+- much easier to implement and debug
+- good enough to validate the head-importance data path
+- avoids modifying or depending on fused kernels early
+
+Why it differs from kernel level:
+- framework-level is higher-level and slower, but simpler
+- kernel-level is closer to production execution, but much harder to instrument
+  and less flexible for early experimentation
+
+## New Entry: Real Trace Sweep And Interpretation
+
+Commands run:
+
+```bash
+python scripts/collect_real_head_traces.py \
+  --model gpt2 \
+  --prompt "The quick brown fox jumps over the lazy dog." \
+  --max-new-tokens 8 \
+  --kv-block-size-tokens 16 \
+  --output-json /tmp/real_head_trace_01.json
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json /tmp/real_head_trace_01.json \
+  --hbm-capacity-pages 32 \
+  --policies score,bandit
+
+python scripts/collect_real_head_traces.py \
+  --model gpt2 \
+  --prompt "In a distant future, researchers built a memory hierarchy for transformer inference where key-value blocks could move between CPU and GPU, and every decode step depended on whether those blocks were already resident when attention began." \
+  --max-new-tokens 12 \
+  --kv-block-size-tokens 16 \
+  --output-json /tmp/real_head_trace_02.json
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json /tmp/real_head_trace_02.json \
+  --hbm-capacity-pages 48 \
+  --policies score,bandit
+
+python scripts/collect_real_head_traces.py \
+  --model gpt2 \
+  --prompt "Memory movement dominates decode latency when spilled KV blocks are not already present in GPU memory." \
+  --max-new-tokens 12 \
+  --kv-block-size-tokens 8 \
+  --output-json /tmp/real_head_trace_03.json
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json /tmp/real_head_trace_03.json \
+  --hbm-capacity-pages 64 \
+  --policies score,bandit
+
+python scripts/collect_real_head_traces.py \
+  --model gpt2 \
+  --prompt "The controller should learn which pages to keep hot, which to evict, and which to prefetch before the next decode step begins." \
+  --max-new-tokens 20 \
+  --kv-block-size-tokens 16 \
+  --output-json /tmp/real_head_trace_04.json
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json /tmp/real_head_trace_04.json \
+  --hbm-capacity-pages 64 \
+  --policies score,bandit
+```
+
+Important note:
+- the earlier `FileNotFoundError` was caused by a filename mismatch
+- the collector wrote `/tmp/real_head_trace_01.json`
+- the evaluator was first pointed at `/tmp/real_head_trace.json`
+
+Observed results:
+
+```text
+Trace 01:
+score   total_miss 22   mean_stall 0.4050   p95 1.6200   prefetch 2   evictions 0
+bandit  total_miss 22   mean_stall 0.4050   p95 1.6200   prefetch 2   evictions 0
+
+Trace 02:
+score   total_miss 46   mean_stall 0.5400   p95 1.6200   prefetch 2   evictions 0
+bandit  total_miss 46   mean_stall 0.5400   p95 1.6200   prefetch 2   evictions 0
+
+Trace 03:
+score   total_miss 46   mean_stall 0.5400   p95 1.6200   prefetch 2   evictions 0
+bandit  total_miss 46   mean_stall 0.5400   p95 1.6200   prefetch 2   evictions 0
+
+Trace 04:
+score   total_miss 34   mean_stall 0.2430   p95 1.6200   prefetch 2   evictions 0
+bandit  total_miss 34   mean_stall 0.2430   p95 1.6200   prefetch 2   evictions 0
+```
+
+Across scorer variants:
+- `passthrough`, `normalized`, `recomputed`, and `predicted_boosted` were effectively identical on these traces
+- `layer_normalized` sometimes improved misses by `1-2` and increased prefetch from `2` to `3` or `4`, but still did not change stall
+
+### Interpretation
+
+1. The real-data pipeline works.
+- Real GPT-2 attentions were collected.
+- They were converted into replay traces with page/head metadata.
+- Those traces ran through the simulator successfully.
+
+2. These traces are not yet stressful enough.
+- Every run ended with `evictions = 0`.
+- Prefetch counts remained very small.
+- The bandit and score-based controller therefore made the same decisions.
+
+3. More data alone is not enough.
+- We need more real traces.
+- But we also need more pressure.
+- If HBM capacity is much larger than the active working set, controller choice will not matter much.
+
+4. These runs validate the data path, not policy superiority.
+- They show that the project can now do:
+  `real model -> real attentions -> replay trace -> controller evaluation`
+- They do not yet show that one controller beats another on real traces.
+
+5. Trace 04's lower stall is a trace property, not a controller win.
+- It means this particular replay configuration created fewer misses per step.
+- Because there was still no eviction pressure, policy quality did not separate.
+
+### What this informs next
+
+- Automate batch collection and replay instead of running one trace at a time.
+- Sweep:
+  - prompt length
+  - decode length
+  - KV block size
+  - replay HBM capacity
+  - later, model choice
+- Choose some replay capacities that are only slightly above the trace's minimum feasible capacity so that the controller has to make meaningful residency decisions.
+
+## New Entry: Batch Real-Trace Replay Study
+
+Commands run:
+
+```bash
+pytest tests/test_kv_controller_core.py
+python -m py_compile scripts/batch_real_head_replay.py
+
+python scripts/batch_real_head_replay.py
+
+python scripts/batch_real_head_replay.py \
+  --output-dir results/real_head_batch \
+  --summary-csv results/real_head_batch/summary.csv
+
+python scripts/batch_real_head_replay.py \
+  --prompt-presets fox,hierarchy,memory,controller \
+  --decode-steps 8,12,12,20 \
+  --kv-block-sizes 16,16,8,16 \
+  --capacities min,min+2,min+4 \
+  --scorers recomputed,layer_normalized \
+  --policies score,bandit \
+  --bandit-menu full \
+  --output-dir results/real_head_pressure \
+  --summary-csv results/real_head_pressure/summary.csv
+
+python scripts/batch_real_head_replay.py \
+  --capacities min,min+2,min+4,min*1.25 \
+  --output-dir results/real_head_capacity_sweep \
+  --summary-csv results/real_head_capacity_sweep/summary.csv
+```
+
+### What the batch study showed
+
+1. The batch harness works.
+- It collected multiple real traces automatically.
+- It inferred minimum feasible capacity from each trace.
+- It replayed those traces under several capacities.
+- It wrote structured CSV summaries.
+
+2. The results were extremely stable across capacities.
+- `fox` stayed at:
+  - recomputed: miss `22`, mean stall `0.4050`, evictions `0`
+  - layer_normalized: miss `21`, mean stall `0.4050`, evictions `0`
+- `hierarchy` stayed at:
+  - recomputed: miss `46`, mean stall `0.5400`, evictions `0`
+  - layer_normalized: miss `44`, mean stall `0.5400`, evictions `0`
+- `memory` stayed at:
+  - recomputed: miss `58` or `46` depending on decode configuration, but always identical across tested capacities
+  - layer_normalized: `1` fewer miss than recomputed, same stall, evictions `0`
+- `controller` stayed at:
+  - recomputed: miss `34`, mean stall `0.2430`, evictions `0`
+  - layer_normalized: miss `33`, mean stall `0.2430`, evictions `0`
+
+3. Score-based and bandit policies remained identical.
+- same misses
+- same stall
+- same prefetch count
+- same zero-eviction behavior
+
+### What this means
+
+The big lesson is more specific than "we need more data."
+The current real-trace replay setup is structurally too easy for a different reason:
+
+- in the real collector, every decode step marks all current causal prefix blocks as `required_pages`
+- for dense causal attention, that required set grows monotonically as decode continues
+- the final step's required set is effectively the full set of blocks ever used
+- the batch harness then sets replay capacity to `min_required_capacity` or slightly above it
+
+So in practice:
+- capacity at `min` is already enough to hold the entire lifetime working set
+- once pages arrive, they never need to be evicted
+- therefore controller choice barely matters
+
+This is why there are:
+- no evictions
+- almost no prefetch differences
+- identical bandit and score behavior
+- no sensitivity to capacity changes above `min`
+
+Important interpretation:
+- this is not a failure of the bandit
+- and not a failure of the scorer
+- it is a limitation of the current real-trace semantics
+
+### Are we collecting per-head information yet?
+
+Yes.
+
+From real model runs we already store:
+- `per_page_head_activity`
+- `query_head_weights`
+- derived `head_weighted_scores`
+
+So the project *has* crossed the threshold of collecting real per-head signals.
+What it does *not* yet have is a real-trace formulation that creates realistic controller pressure.
+
+### What the scorer comparison still tells us
+
+- `layer_normalized` is consistently slightly better than `recomputed` on miss count, usually by `1-2` misses
+- but because there is still no eviction pressure, that improvement does not translate into stall changes
+- so scorer ranking on these traces is still weak evidence
+
+### Recommended next steps
+
+1. Change the real-trace formulation, not just the amount of data.
+- Collecting more traces in the current dense-prefix format will mostly produce the same pattern.
+
+2. Introduce pressure in one of these ways:
+- multi-request replay with interleaved decode steps from several sequences
+- trace extraction that distinguishes:
+  - mandatory pages
+  - highly attended pages
+  - lower-priority pages
+- top-k attended block replay, where not every historical block is treated as equally required
+- a local-window-plus-sparse-attended-block trace representation
+
+3. Keep the current collector output because it is still valuable.
+- It gives us real per-head signals.
+- Those signals can be transformed into richer replay formats offline.
+
+4. The next concrete implementation should probably be:
+- an offline converter from dense real traces into a pressure-inducing replay trace, for example:
+  - always require the most recent block(s)
+  - treat the top-k older attended blocks as the scored sparse set
+  - let the controller decide residency under a tighter capacity
+
+### Conclusion
+
+- The batch automation succeeded.
+- Real per-head data collection succeeded.
+- The current bottleneck is replay semantics, not data collection.
+
+## New Entry: First Pressure-Replay Results
+
+Commands run:
+
+```bash
+python scripts/build_pressure_replays.py \
+  --input-traces /tmp/real_head_trace_01.json,/tmp/real_head_trace_02.json,/tmp/real_head_trace_03.json \
+  --output-dir results/pressure_replays
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/recent_topk.json \
+  --hbm-capacity-pages 24 \
+  --policies score,bandit
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/recent_threshold.json \
+  --hbm-capacity-pages 24 \
+  --policies score,bandit
+
+python scripts/evaluate_replay_scores.py \
+  --trace-json results/pressure_replays/round_robin_interleave.json \
+  --hbm-capacity-pages 48 \
+  --policies score,bandit
+
+python scripts/build_pressure_replays.py \
+  --input-traces /tmp/real_head_trace_01.json,/tmp/real_head_trace_02.json,/tmp/real_head_trace_03.json \
+  --recent-block-window 1 \
+  --top-k-older-per-layer 1 \
+  --score-mass-fraction 0.35 \
+  --output-dir results/pressure_replays_harsh
+```
+
+Observed results:
+
+1. `recent_topk`
+- score: total miss `22`, mean stall `0.3988`, prefetch `2`, evictions `0`
+- bandit: total miss `20`, mean stall `0.3650`, prefetch `4`, evictions `0`
+
+2. `recent_threshold`
+- score: total miss `22`, mean stall `0.3988`, prefetch `2`, evictions `0`
+- bandit: total miss `20`, mean stall `0.3650`, prefetch `4`, evictions `0`
+
+3. `round_robin_interleave`
+- score: total miss `992`, mean stall `4.4550`, prefetch `64`, evictions `1008`
+- bandit: total miss `1021-1028` depending on scorer variant, mean stall `4.5056-4.5141`, prefetch `39-43`, evictions `1016-1019`
+
+### What these results tell us
+
+1. The pressure-inducing transforms work.
+- They finally changed controller behavior.
+- They produced non-identical outcomes between score-based and bandit policies.
+
+2. `recent_topk` and `recent_threshold` are useful, but still low pressure.
+- There are still no evictions.
+- However, the bandit now does better than score-based:
+  - fewer misses
+  - lower mean stall
+  - more aggressive prefetch
+
+Interpretation:
+- These transforms are sparse enough that extra prefetching helps.
+- But they still do not create true residency competition.
+
+3. `round_robin_interleave` is the first genuinely hard replay benchmark.
+- It creates very large miss counts.
+- It creates thousands of evictions.
+- It creates multi-request competition for HBM.
+
+This is the first transformed real trace where the controller is clearly in a high-pressure regime.
+
+4. On the hard interleaved trace, score-based beats the current bandit.
+- Score-based has fewer misses.
+- Lower mean stall.
+- More prefetches.
+
+Interpretation:
+- The bandit is currently too conservative under strong real-trace pressure.
+- Its reward/action tradeoff was tuned mostly on earlier synthetic settings.
+- It is under-prefetching in the interleaved real-pressure regime.
+
+5. `recent_topk` and `recent_threshold` were identical in this run.
+- For these particular traces and settings, the threshold selection ended up choosing essentially the same pages as top-k.
+- That means the current threshold parameter is not yet differentiating the workload.
+
+### What this informs next
+
+1. Keep `round_robin_interleave` as the main real-pressure benchmark.
+- It is the only one so far that clearly forces real controller tradeoffs.
+
+2. Retune the bandit on this benchmark.
+- The current bandit was competitive on earlier synthetic studies.
+- But on the first hard real benchmark it loses to score-based.
+- That is now the clearest tuning target.
+
+3. Explore a combined transform next.
+- Interleave traces that have already been sparsified with `recent_topk` or `recent_threshold`.
+- That may give a more realistic middle ground between:
+  - too easy (`recent_topk` alone)
+  - very harsh (`round_robin_interleave` on dense traces)
+
+4. Differentiate the threshold converter more strongly.
+- The current `score_mass_fraction` did not separate it from top-k.
+- Future runs should try more aggressive values.
+
+### Conclusion
+
+- We now have real per-head data and a real high-pressure replay benchmark.
+- The next step is not more collection first.
+- It is tuning and comparing controllers on the interleaved real-pressure benchmark, plus building a combined sparse+interleaved replay formulation.

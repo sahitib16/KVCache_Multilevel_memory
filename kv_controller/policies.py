@@ -478,7 +478,7 @@ class ContextualBanditController(ResidencyController):
         bootstrap_action: BanditAction | None = None,
         bootstrap_steps: int = 2,
     ):
-        self.actions = actions or build_bandit_action_menu("trimmed")
+        self.actions = actions or build_bandit_action_menu("full")
         self.alpha = alpha
         self.prefetch_penalty = prefetch_penalty
         self.eviction_penalty = eviction_penalty

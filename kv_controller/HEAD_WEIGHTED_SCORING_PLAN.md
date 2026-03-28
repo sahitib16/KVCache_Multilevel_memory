@@ -8,7 +8,8 @@ The key idea is:
 1. define the data we need
 2. carry that data through the simulator and replay path
 3. experiment with score functions offline
-4. only later move toward real engine instrumentation
+4. collect real model signals
+5. only later consider a learned predictor if needed
 
 ## Goal
 
@@ -91,9 +92,30 @@ Eventually:
 Why this progression:
 - it lets us validate tooling before depending on live model instrumentation
 
-## Step 6: Collect Real Head Signals Later
+## Step 6: Collect Real Head Signals From A Real Model
 
-When we are ready for more realism:
+This is the next major transition.
+
+Important clarification:
+- we do **not** need to train a separate model first
+- the first goal is to collect real decode-time head signals and convert them
+  into page-level importance traces
+
+Recommended first path:
+- use a manageable real model
+- instrument decode-time execution
+- log head-level summaries
+- map those summaries onto pages
+- replay those traces through the current controller
+
+Why this comes before training:
+- simpler
+- easier to debug
+- gives us a direct signal path from real execution to controller evaluation
+- avoids prematurely adding another learned system before we know the signal is
+  useful
+
+When we are ready for this step:
 - run a manageable model in eager or instrumented mode
 - log attention or head-summary signals during decode
 - convert those signals into page-level per-head activity
@@ -111,10 +133,60 @@ It should improve:
 - score-based prefetch vs simple prefetch
 - bandit performance when score-based actions are available
 
+## Step 8: Only If Needed, Train A Predictor Later
+
+A learned predictor is optional, not the default next step.
+
+We should consider it only if:
+- real logged head signals are useful
+- direct score construction from those logs is still too weak
+- a learned mapping would likely improve generalization
+
+In that later phase, we could:
+- define page-importance labels or utility labels
+- train a small predictor from logged features
+- compare it against the direct analytic score
+
+## Current Default Position
+
+Right now the project should assume:
+- first collect real head signals
+- first try direct score construction from those signals
+- only later consider training a separate predictor
+
 ## Immediate Next Action
 
-The first implementation step is:
+The next implementation steps are:
 
-- extend the trace/replay path to preserve per-page per-head activity
+1. keep using replay traces as the experiment interface
+2. make the replay schema and page concepts more compatible with a future
+   vLLM-style integration
+3. design the exact logging fields needed from a small real model run
+4. collect real head-summary traces
+5. replay them through the controller
 
-That gives us the raw signal needed for the next score-function experiments.
+## Current Status
+
+Completed so far:
+- Step 1 is done:
+  - replay traces now preserve `per_page_head_activity`
+  - `WorkloadStep` carries both raw head activity and aggregate scores
+- Step 2 is effectively in progress and working:
+  - replay traces can be saved and reloaded
+  - alternate replay-time scorers can now be applied to the same trace
+- Step 3 has started:
+  - multiple score adapters exist
+  - replay-time scorer comparisons are now possible
+
+Current replay-time default:
+- scorer view: `HeadActivityRecomputedScorer`
+  - on synthetic traces this matches the original aggregate score exactly
+  - it is preferred over raw passthrough conceptually because it depends on the
+    primitive replay-preserved signal rather than trusting a pre-baked score
+- bandit action menu: `full`
+  - broader replay studies favored the full menu over the trimmed menu
+
+Next:
+- broaden replay-time scorer studies further when helpful
+- make the replay/logging schema more vLLM-shaped
+- define and collect the first real head-summary traces from a manageable model

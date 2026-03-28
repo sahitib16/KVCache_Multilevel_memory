@@ -28,6 +28,8 @@ class SyntheticTraceConfig:
     attention_heads: int
     query_jitter: float = 0.0
     seed: int = 0
+    prompt_tokens: int = 64
+    kv_block_size_tokens: int = 16
 
 
 class SyntheticTraceGenerator:
@@ -185,6 +187,16 @@ class SyntheticTraceGenerator:
                 for page in page_set
             }
             referenced_layers = tuple(sorted({page.layer_id for page in page_set}))
+            layer_block_tables = {
+                layer_id: tuple(
+                    sorted(
+                        page.page_id
+                        for page in page_set
+                        if page.layer_id == layer_id
+                    )
+                )
+                for layer_id in referenced_layers
+            }
             trace.append(
                 WorkloadStep(
                     step_idx=step_idx,
@@ -195,6 +207,11 @@ class SyntheticTraceGenerator:
                     per_page_head_activity=per_page_head_activity,
                     per_page_features=per_page_features,
                     referenced_layers=referenced_layers,
+                    request_id="synthetic_request_0",
+                    decode_position=step_idx,
+                    sequence_length=self.config.prompt_tokens + step_idx,
+                    kv_block_size_tokens=self.config.kv_block_size_tokens,
+                    layer_block_tables=layer_block_tables,
                 )
             )
         return trace

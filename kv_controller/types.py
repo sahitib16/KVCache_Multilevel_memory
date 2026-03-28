@@ -156,6 +156,27 @@ class WorkloadStep:
     - Optional explicit summary of which layers appear in this step.
     - Even though every ``KVPageId`` already stores a layer id, carrying the
       layer list separately is convenient for controllers and logging.
+
+    ``request_id``:
+    - Logical request/sequence identifier.
+    - This makes replay traces closer to real engine logs where multiple
+      requests may be interleaved or compared.
+
+    ``decode_position``:
+    - Which decode step within the request this record corresponds to.
+
+    ``sequence_length``:
+    - Total decoded sequence length visible to attention at this step.
+
+    ``kv_block_size_tokens``:
+    - How many token positions are grouped into one KV block/page.
+    - This is intentionally vLLM-like because vLLM reasons in terms of
+      block-sized KV chunks.
+
+    ``layer_block_tables``:
+    - Optional per-layer logical block table.
+    - In vLLM-like engines this maps a sequence's logical KV blocks to the
+      block ids/pages that attention needs to read.
     """
 
     step_idx: int
@@ -166,6 +187,11 @@ class WorkloadStep:
     per_page_head_activity: dict[KVPageId, tuple[float, ...]] = field(default_factory=dict)
     per_page_features: dict[KVPageId, dict[str, float]] = field(default_factory=dict)
     referenced_layers: tuple[int, ...] = ()
+    request_id: str = ""
+    decode_position: int = 0
+    sequence_length: int = 0
+    kv_block_size_tokens: int = 16
+    layer_block_tables: dict[int, tuple[int, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -199,6 +225,11 @@ class ControllerContext:
     per_page_head_activity: dict[KVPageId, tuple[float, ...]]
     per_page_features: dict[KVPageId, dict[str, float]]
     query_head_weights: dict[int, tuple[float, ...]]
+    request_id: str
+    decode_position: int
+    sequence_length: int
+    kv_block_size_tokens: int
+    layer_block_tables: dict[int, tuple[int, ...]]
     layer_budgets: dict[int, LayerBudget]
     slot_to_page: dict[int, KVPageId]
     page_to_slot: dict[KVPageId, int]

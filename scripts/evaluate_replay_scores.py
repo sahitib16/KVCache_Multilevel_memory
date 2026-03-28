@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bandit-menus",
         type=str,
-        default="trimmed",
+        default="full",
         help="Comma-separated bandit action-menu presets to compare when bandit is enabled.",
     )
     return parser
@@ -109,13 +109,38 @@ def build_or_load_trace(args):
     return trace
 
 
-def build_simulator(args) -> OverlapAwareSimulator:
+def infer_trace_shape(trace) -> tuple[int, int, int]:
+    """Infer `(steps, layers, min_required_capacity)` from a replay trace.
+
+    This is especially important for real traces loaded from JSON:
+    the replay file may describe a different model shape than the CLI defaults.
+    """
+
+    steps = len(trace)
+    layers = max((page.layer_id for step in trace for page in step.required_pages), default=-1) + 1
+    min_required_capacity = max((len(step.required_pages) for step in trace), default=0)
+    return steps, layers, min_required_capacity
+
+
+def build_simulator(args, trace=None) -> OverlapAwareSimulator:
+    steps = args.steps
+    layers = args.layers
+    if trace is not None:
+        inferred_steps, inferred_layers, min_required_capacity = infer_trace_shape(trace)
+        steps = inferred_steps
+        layers = inferred_layers
+        if args.hbm_capacity_pages < min_required_capacity:
+            raise ValueError(
+                f"HBM capacity {args.hbm_capacity_pages} is too small for this trace. "
+                f"Minimum required pages: {min_required_capacity}."
+            )
+
     return OverlapAwareSimulator(
         SimulationConfig(
-            steps=args.steps,
+            steps=steps,
             cache=CacheConfig(
                 hbm_capacity_pages=args.hbm_capacity_pages,
-                layers=args.layers,
+                layers=layers,
                 page_bytes=args.page_bytes,
             ),
             transfer=TransferConfig(
@@ -214,7 +239,7 @@ def main() -> None:
             results = benchmark_policies(
                 policy_names=policy_names,
                 trace=rescored_trace,
-                simulator_builder=lambda: build_simulator(args),
+                simulator_builder=lambda: build_simulator(args, rescored_trace),
                 controller_builder=lambda policy_name: build_controller(
                     policy_name,
                     args.prefetch_k,

@@ -132,6 +132,14 @@ def trace_to_json_rows(trace: list[WorkloadStep]) -> list[dict[str, object]]:
                 "per_page_head_activity": _head_activity_to_json(step.per_page_head_activity),
                 "per_page_features": _features_to_json(step.per_page_features),
                 "referenced_layers": list(step.referenced_layers),
+                "request_id": step.request_id,
+                "decode_position": step.decode_position,
+                "sequence_length": step.sequence_length,
+                "kv_block_size_tokens": step.kv_block_size_tokens,
+                "layer_block_tables": {
+                    str(layer_id): list(blocks)
+                    for layer_id, blocks in step.layer_block_tables.items()
+                },
             }
         )
     return rows
@@ -165,6 +173,14 @@ def load_trace_json(path: str) -> list[WorkloadStep]:
                 per_page_head_activity=_head_activity_from_json(row.get("per_page_head_activity", [])),
                 per_page_features=_features_from_json(row.get("per_page_features", [])),
                 referenced_layers=tuple(int(layer_id) for layer_id in row.get("referenced_layers", [])),
+                request_id=str(row.get("request_id", "")),
+                decode_position=int(row.get("decode_position", row.get("step_idx", 0))),
+                sequence_length=int(row.get("sequence_length", 0)),
+                kv_block_size_tokens=int(row.get("kv_block_size_tokens", 16)),
+                layer_block_tables={
+                    int(layer_id): tuple(int(block_id) for block_id in blocks)
+                    for layer_id, blocks in dict(row.get("layer_block_tables", {})).items()
+                },
             )
         )
     return trace

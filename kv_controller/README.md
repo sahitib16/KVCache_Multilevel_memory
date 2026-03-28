@@ -15,6 +15,13 @@ toward a clean engine-level simulation framework where we can plug in:
 This README is meant to be updated as the package grows. It now documents the
 Step 1 core plus the Step 2 interface formalization.
 
+For the practical real-trace workflow, use
+[HEAD_WEIGHTED_SCORING_WORKFLOW.md](/home/sbulusu31/kv_multilevel/kv_controller/HEAD_WEIGHTED_SCORING_WORKFLOW.md).
+That guide contains the current commands for:
+- collecting real head-summary traces
+- replaying them through the simulator
+- interpreting common errors like missing files or undersized HBM capacity
+
 ## Big Picture
 
 The simulator models the following idea:

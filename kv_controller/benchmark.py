@@ -133,6 +133,11 @@ def collect_step_rows(policy_name: str, metrics) -> list[dict[str, object]]:
                 "transfer_backlog": row.transfer_backlog,
                 "inflight_transfers": row.inflight_transfers,
                 "churn": row.churn,
+                "demand_miss_pages": len(row.demand_miss_pages),
+                "prefetched_pages": len(row.prefetched_pages),
+                "evicted_pages": len(row.evicted_pages),
+                "accessed_pages": len(row.accessed_pages),
+                "resident_pages_end": len(row.resident_pages_end),
             }
         )
     return rows

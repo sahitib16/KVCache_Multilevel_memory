@@ -1553,3 +1553,196 @@ Decision:
   - broader validation
   - stronger diagnostics
   - scorer-default decision
+
+2026-03-30 - Larger Public-Dataset Validation For Scorer Decision
+-----------------------------------------------------------------
+
+Goal:
+- run a larger public-dataset validation so we can settle `normalized` vs
+  `layer_normalized` more cleanly
+- use a larger slice of real prompts before deciding whether analytic scoring
+  is enough or whether a learned predictor is needed
+
+Data collected:
+- `8` prompts from `HuggingFaceH4/mt_bench_prompts`
+- `8` prompts from `OpenAssistant/oasst1`
+- total: `16` real prompt traces
+
+Collected trace examples:
+- `results/dataset_head_traces/mt_bench_8/mt_bench_writing_0.json`
+- `results/dataset_head_traces/oasst1_8/oasst1_0.json`
+
+Pressure traces built from the 16 collected traces:
+- `recent_threshold_round_robin_interleave`
+  - steps: `192`
+  - layers: `12`
+  - min_required_capacity: `27`
+- `round_robin_interleave`
+  - steps: `192`
+  - layers: `12`
+  - min_required_capacity: `60`
+
+Main benchmark used for scorer decision:
+- `results/dataset_head_traces/pressure_16/recent_threshold_round_robin_interleave.json`
+
+Main benchmark results:
+
+score:
+- total_miss `4155`
+- mean_stall `2.9995`
+- p95_stall `3.5100`
+- prefetch `74`
+- evictions `4197`
+
+bandit + normalized:
+- total_miss `4155`
+- mean_stall `2.9517`
+- p95_stall `3.5100`
+- prefetch `24`
+- evictions `4147`
+
+bandit + layer_normalized:
+- total_miss `4155`
+- mean_stall `2.9883`
+- p95_stall `3.5100`
+- prefetch `67`
+- evictions `4190`
+
+bandit + recomputed:
+- total_miss `4155`
+- mean_stall `2.9700`
+- p95_stall `3.5100`
+- prefetch `43`
+- evictions `4166`
+
+Diagnostics on the larger dataset-backed main benchmark:
+
+normalized:
+- top1/top2/top4 next-step hit rate: `1.0000`
+- top8 next-step hit rate: `0.9986`
+- mean_reused_page_rank: `0.4132`
+
+layer_normalized:
+- top1/top2/top4 next-step hit rate: `1.0000`
+- top8 next-step hit rate: `0.9950`
+- mean_reused_page_rank: `0.4095`
+
+Interpretation:
+- the larger public-dataset validation makes the scorer decision clearer than
+  before
+- on control performance, `normalized` is the strongest replay-time scorer on
+  the main benchmark:
+  - same misses as `score`
+  - lower mean stall than `layer_normalized`
+  - far fewer prefetches and evictions than `layer_normalized`
+- `layer_normalized` still looks slightly better on reused-page-rank
+  diagnostics, but that advantage is small and does not translate into better
+  controller outcomes on this benchmark
+- diagnostics remain somewhat saturated, so they are useful as supporting
+  evidence but not strong enough to override the control results
+
+Decision:
+- keep the analytic scorer path
+- do not introduce a learned predictor yet
+- adopt `normalized` as the current replay-time default scorer view
+- treat `layer_normalized` as a strong alternative for future comparison, not
+  the default
+
+Why no learned predictor yet:
+- real per-head data collection is working
+- replay-time evaluation on public datasets is working
+- the analytic scorer family is still competitive and interpretable
+- scorer gaps are present but not large enough yet to justify the complexity of
+  a learned predictor
+
+Next head-weighted-scoring-plan work:
+- one more targeted validation round only if needed for confidence
+- otherwise close out scorer-selection and move on to the next feature phase
+
+2026-03-31 - Converting The Repo From "Benchmark Harness" To Page-Wise Simulator
+------------------------------------------------------------------------------
+
+Why this change was needed:
+- feedback from Dr. Shi was fair in an important way:
+  - the repo already had a real simulator core
+  - but most outputs still looked like benchmark summaries
+  - it was missing the page-wise / tile-wise statistics layer that makes a
+    simulator convincing and useful for algorithm study
+
+What was already true before this change:
+- the simulator already operated on explicit page identities
+- `WorkloadStep` already carried page-level required and predicted sets
+- cache state already tracked page residency and HBM slots
+- the scheduler already modeled page transfers and overlap
+
+What was missing:
+- explicit exported page-wise statistics after a run
+- explicit exported tile-wise aggregations
+- direct visibility into:
+  - which pages missed
+  - which pages were prefetched
+  - which prefetched pages were later useful vs wasted
+  - which pages were evicted
+  - how long pages stayed resident
+  - per-page reuse-distance statistics
+
+Implemented in this update:
+- `StepMetrics` now records:
+  - `demand_miss_pages`
+  - `prefetched_pages`
+  - `evicted_pages`
+  - `accessed_pages`
+  - `resident_pages_end`
+- `OverlapAwareSimulator` now fills those fields every step
+- new `stats.py` module now builds:
+  - per-page summaries
+  - per-layer summaries
+  - per-tile summaries
+- `run_kv_controller_sim.py` now supports:
+  - `--page-stats-csv`
+  - `--layer-stats-csv`
+  - `--tile-stats-csv`
+  - `--tile-size-pages`
+
+Example smoke-test command:
+
+`python scripts/run_kv_controller_sim.py --policy score --steps 8 --page-stats-csv /tmp/page_stats.csv --layer-stats-csv /tmp/layer_stats.csv --tile-stats-csv /tmp/tile_stats.csv`
+
+Example exported page-level columns:
+- `access_count`
+- `demand_miss_count`
+- `prefetch_submit_count`
+- `prefetch_hit_count`
+- `prefetch_wasted_count`
+- `eviction_count`
+- `resident_steps`
+- `first_access_step`
+- `last_access_step`
+- `mean_reuse_distance`
+- `short_reuse_count`
+- `long_reuse_count`
+
+Example exported tile-level columns:
+- `layer_id`
+- `tile_id`
+- `tile_size_pages`
+- aggregated access / miss / prefetch / eviction / reuse counts
+
+Validation:
+- `pytest tests/test_kv_controller_core.py`
+  - result: `30 passed`
+- `python -m py_compile kv_controller/*.py scripts/run_kv_controller_sim.py`
+  - passed
+
+Interpretation:
+- the repo was not "just a benchmark system", but the feedback identified a
+  real gap in observability
+- after this update, the simulator now exposes the page-wise and tile-wise
+  statistics needed to study page- or tile-level algorithms directly
+- this makes it much easier to validate whether a policy is practical before
+  changing prediction strategies
+
+Next recommended simulator work:
+- add tile-aware replay transforms or tile-aware policy baselines if needed
+- use the new page/tile CSVs to validate whether the current replay workloads
+  produce realistic hot/cold and reuse patterns

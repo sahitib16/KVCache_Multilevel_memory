@@ -333,4 +333,9 @@ class StepMetrics:
     transfer_backlog: int = 0
     inflight_transfers: int = 0
     churn: int = 0
+    demand_miss_pages: tuple[KVPageId, ...] = ()
+    prefetched_pages: tuple[KVPageId, ...] = ()
+    evicted_pages: tuple[KVPageId, ...] = ()
+    accessed_pages: tuple[KVPageId, ...] = ()
+    resident_pages_end: tuple[KVPageId, ...] = ()
     notes: list[str] = field(default_factory=list)

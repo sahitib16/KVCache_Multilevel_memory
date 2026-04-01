@@ -92,6 +92,7 @@ class OverlapAwareSimulator:
         required_pages: tuple[KVPageId, ...],
         decision: PolicyOutput,
         metrics: StepMetrics,
+        evicted_pages: list[KVPageId] | None = None,
     ) -> None:
         """Apply explicit evictions and, if necessary, fallback capacity evictions.
 
@@ -110,6 +111,8 @@ class OverlapAwareSimulator:
                 continue
             self.state.evict(page, metrics.step_idx)
             metrics.evictions += 1
+            if evicted_pages is not None:
+                evicted_pages.append(page)
 
         while len(self.state.resident_pages) + len(self.state.inflight_pages) >= self.config.cache.hbm_capacity_pages:
             candidates = [page for page in self.state.resident_pages if page not in protected]
@@ -118,11 +121,14 @@ class OverlapAwareSimulator:
             victim = min(candidates, key=lambda page: self.state.last_access_step.get(page, -1))
             self.state.evict(victim, metrics.step_idx)
             metrics.evictions += 1
+            if evicted_pages is not None:
+                evicted_pages.append(victim)
 
     def _enforce_layer_budgets(
         self,
         required_pages: tuple[KVPageId, ...],
         metrics: StepMetrics,
+        evicted_pages: list[KVPageId] | None = None,
     ) -> None:
         """Evict over-budget layers until their occupancy fits the policy budgets.
 
@@ -155,6 +161,8 @@ class OverlapAwareSimulator:
                 victim = min(candidates, key=lambda page: self.state.last_access_step.get(page, -1))
                 self.state.evict(victim, metrics.step_idx)
                 metrics.evictions += 1
+                if evicted_pages is not None:
+                    evicted_pages.append(victim)
 
     def run_step(self, step: WorkloadStep, controller: ResidencyController) -> StepMetrics:
         """Run one decode step from controller decision to decode completion."""
@@ -169,6 +177,10 @@ class OverlapAwareSimulator:
             required_pages=len(step.required_pages),
             predicted_pages=len(step.predicted_pages),
         )
+        demand_miss_pages: list[KVPageId] = []
+        prefetched_pages: list[KVPageId] = []
+        evicted_pages: list[KVPageId] = []
+        accessed_pages: list[KVPageId] = []
 
         # Ask the controller what to do, given the current system state.
         context = self._make_context(step)
@@ -177,18 +189,19 @@ class OverlapAwareSimulator:
         # Apply any layer budget changes first so later policy logic can honor
         # the new budget picture.
         self.state.apply_layer_budgets(decision.layer_budgets)
-        self._enforce_layer_budgets(step.required_pages, metrics)
-        self._evict_if_needed(step.required_pages, decision, metrics)
+        self._enforce_layer_budgets(step.required_pages, metrics, evicted_pages)
+        self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
 
         # Submit proactive prefetches chosen by the controller.
         for page in decision.prefetch_pages:
             if self.state.has_resident(page) or self.state.has_inflight(page):
                 continue
-            self._evict_if_needed(step.required_pages, decision, metrics)
+            self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
             if len(self.state.resident_pages) + len(self.state.inflight_pages) >= self.config.cache.hbm_capacity_pages:
                 continue
             self.scheduler.submit(page, TransferKind.PREFETCH, self.state, metrics)
             metrics.prefetch_submitted += 1
+            prefetched_pages.append(page)
 
         # Now guarantee the current step's required pages are on the way.
         demand_misses = 0
@@ -197,13 +210,14 @@ class OverlapAwareSimulator:
                 self.state.mark_access(page, step.step_idx)
                 continue
             if not self.state.has_inflight(page):
-                self._evict_if_needed(step.required_pages, decision, metrics)
+                self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
                 if len(self.state.resident_pages) + len(self.state.inflight_pages) >= self.config.cache.hbm_capacity_pages:
                     # Final safety valve: if we are still full, fall back to the
                     # simulator's default eviction behavior.
-                    self._evict_if_needed(step.required_pages, PolicyOutput(), metrics)
+                    self._evict_if_needed(step.required_pages, PolicyOutput(), metrics, evicted_pages)
                 self.scheduler.submit(page, TransferKind.DEMAND, self.state, metrics)
                 demand_misses += 1
+                demand_miss_pages.append(page)
 
         metrics.demand_misses = demand_misses
 
@@ -223,6 +237,7 @@ class OverlapAwareSimulator:
         # Once the pages are available, the current step touches them.
         for page in step.required_pages:
             self.state.mark_access(page, step.step_idx)
+            accessed_pages.append(page)
 
         # Run the simulated decode kernel and allow overlap with background copy.
         self.scheduler.overlap_compute(self.state, metrics)
@@ -231,6 +246,11 @@ class OverlapAwareSimulator:
         metrics.inflight_transfers = self.scheduler.inflight_count()
         metrics.transfer_backlog = self.state.transfer_state.backlog
         metrics.churn = self.state.churn
+        metrics.demand_miss_pages = tuple(demand_miss_pages)
+        metrics.prefetched_pages = tuple(prefetched_pages)
+        metrics.evicted_pages = tuple(evicted_pages)
+        metrics.accessed_pages = tuple(accessed_pages)
+        metrics.resident_pages_end = tuple(sorted(self.state.resident_pages))
         self.state.register_miss_batch(demand_misses, len(step.required_pages))
         controller.observe(context, decision, metrics)
         return metrics

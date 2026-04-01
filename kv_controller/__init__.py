@@ -55,6 +55,7 @@ from .scoring import (
 from .score_diagnostics import diagnose_trace_scores
 from .scheduler import OverlapTransferScheduler
 from .simulator import OverlapAwareSimulator
+from .stats import summarize_page_tile_stats, write_rows_csv
 from .state import CacheState
 from .trace_transforms import (
     convert_trace_recent_threshold,
@@ -123,6 +124,7 @@ __all__ = [
     "interleave_sparse_recent_topk_traces",
     "save_trace_json",
     "SimulationConfig",
+    "summarize_page_tile_stats",
     "StepMetrics",
     "SyntheticTraceConfig",
     "SyntheticTraceGenerator",
@@ -132,6 +134,7 @@ __all__ = [
     "TransferState",
     "trace_to_json_rows",
     "WorkloadStep",
+    "write_rows_csv",
     "summarize_run",
     "write_step_csv",
     "write_summary_csv",

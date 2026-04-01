@@ -47,7 +47,9 @@ from kv_controller import (
     SyntheticTraceGenerator,
     TransferConfig,
     save_trace_json,
+    summarize_page_tile_stats,
     write_aggregate_summary_csv,
+    write_rows_csv,
     write_step_csv,
     write_summary_csv,
 )
@@ -135,6 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-csv", type=str, default="")
     parser.add_argument("--summary-csv", type=str, default="")
     parser.add_argument("--aggregate-summary-csv", type=str, default="")
+    parser.add_argument("--page-stats-csv", type=str, default="")
+    parser.add_argument("--layer-stats-csv", type=str, default="")
+    parser.add_argument("--tile-stats-csv", type=str, default="")
+    parser.add_argument("--tile-size-pages", type=int, default=4)
     return parser
 
 
@@ -342,6 +348,16 @@ def main() -> None:
 
     write_step_csv(args.step_csv, results)
     write_summary_csv(args.summary_csv, results)
+
+    if len(results) == 1 and (args.page_stats_csv or args.layer_stats_csv or args.tile_stats_csv):
+        page_rows, layer_rows, tile_rows = summarize_page_tile_stats(
+            trace=trace,
+            metrics=results[0].metrics,
+            tile_size_pages=args.tile_size_pages,
+        )
+        write_rows_csv(args.page_stats_csv, page_rows)
+        write_rows_csv(args.layer_stats_csv, layer_rows)
+        write_rows_csv(args.tile_stats_csv, tile_rows)
 
 
 if __name__ == "__main__":

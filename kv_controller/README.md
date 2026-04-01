@@ -450,6 +450,44 @@ Done in Step 4:
 - the bandit uses one-step delayed reward credit so prefetch decisions are credited closer to when they pay off
 - stall accounting now includes demand-transfer queue delay, so latency differences between policies are visible
 
+Done in simulator instrumentation:
+- each simulated step now records page-level events:
+  - demand-miss pages
+  - prefetched pages
+  - evicted pages
+  - accessed pages
+  - resident pages at end of step
+- the CLI can now export:
+  - per-page CSV statistics
+  - per-layer CSV statistics
+  - per-tile CSV statistics
+- this makes the project usable as a page-wise simulator rather than only a
+  benchmark harness
+
+## Page-Wise And Tile-Wise Statistics
+
+To export page-wise, layer-wise, and tile-wise statistics from one run:
+
+```bash
+python scripts/run_kv_controller_sim.py \
+  --policy score \
+  --steps 8 \
+  --page-stats-csv results/page_stats.csv \
+  --layer-stats-csv results/layer_stats.csv \
+  --tile-stats-csv results/tile_stats.csv \
+  --tile-size-pages 4
+```
+
+The exported CSVs include signals such as:
+- access count
+- demand miss count
+- prefetch submit / hit / wasted count
+- eviction count
+- resident-step count
+- first / last access step
+- mean reuse distance
+- short vs long reuse counts
+
 Not done yet:
 - integration with your older experiment scripts
 - real model-derived head-weight estimation from eager attention logs

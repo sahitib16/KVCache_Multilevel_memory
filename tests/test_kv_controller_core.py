@@ -39,6 +39,7 @@ from kv_controller import (
     interleave_traces_round_robin,
     load_trace_json,
     save_trace_json,
+    summarize_page_tile_stats,
 )
 
 
@@ -176,6 +177,17 @@ def test_transfer_state_is_populated_and_backlog_is_non_negative():
     assert all(row.transfer_backlog >= 0 for row in rows)
 
 
+def test_step_metrics_capture_pagewise_events():
+    sim = make_sim(hbm_capacity_pages=8)
+    trace = make_trace(steps=3)
+    rows = sim.run(trace, PredictedPrefetchController(k=2))
+
+    assert any(row.accessed_pages for row in rows)
+    assert all(len(row.accessed_pages) == row.required_pages for row in rows)
+    assert all(isinstance(row.resident_pages_end, tuple) for row in rows)
+    assert all(isinstance(row.prefetched_pages, tuple) for row in rows)
+
+
 def test_decode_launch_requires_required_pages_to_be_resident_and_slotted():
     sim = make_sim(hbm_capacity_pages=8)
     trace = make_trace(steps=1)
@@ -247,6 +259,21 @@ def test_apply_scorer_to_trace_updates_head_weighted_score_field():
     assert rescored[0].head_weighted_scores != trace[0].head_weighted_scores
     sample_page = next(iter(rescored[0].head_weighted_scores))
     assert rescored[0].per_page_features[sample_page]["head_weighted_score"] == rescored[0].head_weighted_scores[sample_page]
+
+
+def test_page_and_tile_stats_aggregate_pagewise_behavior():
+    trace = make_trace(steps=4)
+    sim = make_sim(hbm_capacity_pages=8)
+    metrics = sim.run(trace, PredictedPrefetchController(k=2))
+
+    page_rows, layer_rows, tile_rows = summarize_page_tile_stats(trace, metrics, tile_size_pages=2)
+
+    assert page_rows
+    assert layer_rows
+    assert tile_rows
+    assert sum(int(row["access_count"]) for row in page_rows) == sum(len(step.required_pages) for step in trace)
+    assert sum(int(row["access_count"]) for row in layer_rows) == sum(len(step.required_pages) for step in trace)
+    assert sum(int(row["access_count"]) for row in tile_rows) == sum(len(step.required_pages) for step in trace)
 
 
 def test_score_based_controller_prefetches_from_predicted_pages():

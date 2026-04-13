@@ -1746,3 +1746,61 @@ Next recommended simulator work:
 - add tile-aware replay transforms or tile-aware policy baselines if needed
 - use the new page/tile CSVs to validate whether the current replay workloads
   produce realistic hot/cold and reuse patterns
+
+2026-04-13 - Simplified Simulator Around Page-Correctness First
+--------------------------------------------------------------
+
+Why this change was made:
+- follow-up feedback pointed out two risks:
+  - we should not present the project as a precise vLLM offload simulator
+  - `simulator.py` had become harder to verify because too much logic lived in
+    one long step function
+
+Main decision:
+- keep the simulator page-level and controller-oriented
+- treat timing as secondary
+- make the core decode-step flow easier to inspect and verify
+
+What changed in `simulator.py`:
+- added `_check_step_feasible(...)`
+  - rejects steps whose required-page set is larger than total HBM capacity
+- split `run_step(...)` into smaller helpers:
+  - `_apply_budget_and_eviction_policy(...)`
+  - `_prefetch_decision_pages(...)`
+  - `_submit_required_pages(...)`
+  - `_verify_required_pages_ready(...)`
+  - `_record_page_accesses(...)`
+  - `_finalize_metrics(...)`
+
+What this accomplishes:
+- the main step loop now reads as:
+  1. check page-feasibility
+  2. build controller context
+  3. apply controller eviction/budget decisions
+  4. submit prefetches
+  5. guarantee required pages are resident or in flight
+  6. wait until required pages are ready
+  7. verify residency invariant
+  8. record accesses
+  9. finalize page-wise metrics
+- this makes the simulator easier to reason about as a page-wise state machine
+  instead of a mixed timing/control routine
+
+What did *not* change:
+- the simulator still uses the same scheduler and state objects
+- timing fields are still present
+- exported page / layer / tile stats still work
+- benchmark behavior stayed stable on the smoke test
+
+Validation:
+- `pytest tests/test_kv_controller_core.py`
+  - result: `30 passed`
+- `python -m py_compile kv_controller/*.py scripts/run_kv_controller_sim.py`
+  - passed
+- `python scripts/run_kv_controller_sim.py --policy score --steps 8 --page-stats-csv /tmp/page_stats.csv --layer-stats-csv /tmp/layer_stats.csv --tile-stats-csv /tmp/tile_stats.csv`
+  - ran successfully
+
+Interpretation:
+- this does not make the simulator a precise vLLM model
+- it does make the simulator cleaner, more verifiable, and better aligned with
+  the project's page-statistics-first framing

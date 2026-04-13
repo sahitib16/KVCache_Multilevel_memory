@@ -1,5 +1,37 @@
 # Overlap-Aware Multi-Tier KV Controller Plan
 
+## Research Goal And Novel Claim
+
+We are **not** trying to build a cycle-accurate or implementation-faithful
+simulator of vLLM offloading. Instead, the goal of this project is to build a
+**page-level KV residency simulator and evaluation framework** that is simple
+enough to verify, rich enough to express realistic controller choices, and
+useful for studying which page-management strategies are practical under
+capacity pressure.
+
+The intended novel contribution is:
+- a reusable **page-wise / tile-wise simulator** for KV residency control
+- a clear methodology for validating controllers using **page statistics**
+  instead of overclaiming timing fidelity
+- a comparative study of when different policy families help:
+  - recency / sliding-window policies
+  - score-based policies
+  - adaptive prefetch and budget policies
+  - future extensions like head-aware and reuse-aware hybrids
+
+The key publishable systems question is:
+- given only page-level state and page-level predictive signals, which
+  controller designs most effectively reduce misses, churn, wasted prefetch,
+  and harmful evictions under realistic memory pressure?
+
+The simulator should therefore be judged first by:
+- correctness of page-wise behavior
+- quality of page-wise and tile-wise statistics
+- usefulness for comparing controller strategies
+
+Timing is still allowed as a secondary derived signal, but it is **not** the
+primary validation target until the page-level behavior is clearly correct.
+
 ## Summary
 The repo already proves the core motivation and has a usable experimental base:
 - `baseline_decode_hbm.py` establishes the HBM-only lower bound.
@@ -7,13 +39,16 @@ The repo already proves the core motivation and has a usable experimental base:
 - `irregular_lru_*` adds LRU, fixed prefetch sweeps, step logging, and some query-aware sparse-page experiments.
 - `kv_smoketests.py` is the best current “benchmark-style” harness, with fixed traces and tail metrics.
 
-The main gap is architectural: the project is still a set of duplicated scripts with forced `torch.cuda.synchronize()` behavior, not a reusable engine-level controller with explicit overlap, pluggable policies, oracle bounds, or layer-aware state.
+The main gap is no longer just architectural; it is also about framing and
+validation. The project needs to look like a **page-level simulator with
+page-wise outputs**, not merely a benchmark driver with summary tables.
 
 Current project status:
 - Steps 1-4 are now implemented in the new `kv_controller/` package.
 - The simulator core exists, has explicit page-level interfaces, and is covered by automated tests.
 - Static baseline controllers and future-aware oracle controllers now exist.
 - The first adaptive / learning-based controller now exists as a lightweight contextual bandit.
+- Page-wise, layer-wise, and tile-wise CSV statistics now exist for simulator runs.
 
 Implemented now:
 - reusable simulator core (`types`, `state`, `scheduler`, `simulator`, `workload`)
@@ -26,6 +61,7 @@ Implemented now:
 - reusable benchmark helpers and CLI driver
 - automated tests for core invariants and policy wiring
 - real per-head signal collection from small real models through replay traces
+- page-wise / tile-wise simulator statistics
 - pressure-inducing replay formulations:
   - sparse single-request replay
   - sparse+interleaved replay
@@ -37,7 +73,7 @@ Not implemented yet:
 - adaptive layer-budget control
 - compression policy and compression-aware transfer model
 - richer benchmark reporting with stronger parity to old script experiments
-- more discriminative stall/latency model across policies
+- more discriminative page-pressure validation across policies
 - vLLM trace replay / shadow mode / gated live integration
 - broader real-trace collection across more prompts/models and replay-driven verification
 - replay-trace bandit retuning on the new main real benchmark
@@ -72,7 +108,12 @@ Status:
 
 Status:
 - Partially done. A discrete-event overlap-aware scheduler exists and reports the main timing fields.
-- Future refinement is still needed so `stall_ms` becomes more discriminative across stronger policies.
+- Important change in interpretation:
+  - these timing fields are now secondary
+  - page statistics should be the main validation target until the simulator is
+    obviously correct at the page level
+- Future refinement is still allowed later, but timing should not drive the
+  research story right now.
 
 4. Rebuild baselines in the new harness.
 - Baseline A: HBM-only lower bound.
@@ -219,6 +260,11 @@ Current note:
 
 Status:
 - In progress. There is now a simulator driver, automated tests, multi-policy comparison mode, and optional step/summary CSV output.
+- New requirement:
+  - every meaningful experiment should also be able to emit page-wise,
+    layer-wise, or tile-wise statistics
+- These outputs should become the default evidence source for simulator
+  validation, with time fields treated as supporting context.
 - A more polished benchmark harness is still pending, but the current driver is already sufficient for repeatable policy comparisons.
 - New benchmarking direction:
   - collect a broader real-trace set
@@ -228,6 +274,10 @@ Status:
 ## Test Plan
 - Unit tests for cache invariants: slot map consistency, no duplicate residency, eviction correctness, and protected needed pages not evicted within a step.
 - Unit tests for transfer scheduler: copy completion ordering, in-flight cap enforcement, readiness gating before decode launch, and correct stall accounting.
+- Unit tests for page-wise and tile-wise statistics:
+  - page access counts sum to required-page touches
+  - miss / prefetch / eviction accounting is preserved in exported stats
+  - tile aggregation preserves totals from page rows
 - Unit tests for Belady oracle on small hand-built traces where the optimal answer is known.
 - Unit tests for scorer adapters: deterministic top-k page ranking and stable exclusion of already-local-window pages.
 - Integration tests that reproduce current qualitative findings:
@@ -235,6 +285,13 @@ Status:
   - irregular workload: aggressive static prefetch can increase churn and wasted transfer
   - query-jitter workload: prediction-sensitive prefetch loses value
 - Regression tests that compare new harness outputs against current script-level results within a tolerance, especially for HBM-only kernel time and demand-fetch transfer dominance.
+- Simulator validation should now prioritize:
+  - page miss counts
+  - page reuse-distance summaries
+  - prefetch usefulness / waste
+  - eviction counts
+  - per-layer and per-tile pressure
+- Time should be reported, but should not be treated as the primary correctness target.
 - Step 4 adaptive-controller validation should happen in four layers:
   - simulator-only evaluation on fixed traces for reward, regret, mean stall, and tail stall
   - vLLM trace replay, where real decode traces are captured from vLLM and replayed offline through this controller interface
@@ -250,8 +307,12 @@ Status:
 - The many `*_commented.py` files are documentation artifacts, not primary implementation targets.
 - Current scripts in `scripts/` are the active project code; `external/Quest` is third-party and should stay vendored.
 - Near-term novelty should come from controller design, overlap-aware scheduling, oracle grounding, and layer-aware budgeting, not from new sparse-attention math.
+- Near-term novelty should be framed around:
+  - page-wise / tile-wise simulator methodology
+  - page-aware controller comparison
+  - interpretable predictive signals like head score, churn, pressure, and reuse
 - If real per-layer/model traces are unavailable initially, synthetic multi-layer traces are acceptable for building and validating the controller architecture before integrating with a paged-KV engine.
 - For vLLM integration, the safest path is:
-  - first validate adaptive behavior in the simulator
+  - first validate page-wise behavior in the simulator
   - then validate interface compatibility with vLLM using trace replay
   - then use shadow mode before allowing live control decisions

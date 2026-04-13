@@ -7,20 +7,17 @@ from .types import ControllerContext, KVPageId, PolicyOutput, SimulationConfig, 
 
 
 class OverlapAwareSimulator:
-    """Reusable engine-level simulator for page residency and transfer overlap.
+    """Page-level KV residency simulator with optional overlap timing.
 
-    This is the top-level object that "runs the world".
+    The most important part of this class is *not* timing fidelity.
+    Its primary job is to enforce page-level correctness:
+    - which pages are required for the step
+    - which pages are resident already
+    - which pages must be transferred
+    - which pages may be evicted or prefetched
 
-    It is responsible for:
-    - holding onto cache state
-    - holding onto the transfer scheduler
-    - building controller context each step
-    - applying policy decisions
-    - ensuring required pages are resident before decode
-    - collecting metrics
-
-    The simulator itself does not contain a smart policy.
-    Instead, it asks a controller what to do, then enforces the system rules.
+    Timing is modeled too, but it is secondary. The simulator should first be
+    read as a page-wise state machine with a small timing layer attached.
     """
 
     def __init__(self, config: SimulationConfig):
@@ -86,6 +83,102 @@ class OverlapAwareSimulator:
             transfer_completion_times_ms=dict(self.state.transfer_state.completion_times_ms),
             overlap_budget_ms=self.state.transfer_state.overlap_budget_ms,
         )
+
+    def _check_step_feasible(self, step: WorkloadStep) -> None:
+        """Reject traces that require more pages at once than HBM can ever hold."""
+        unique_required_pages = len(set(step.required_pages))
+        if unique_required_pages > self.config.cache.hbm_capacity_pages:
+            raise RuntimeError(
+                "Step requires more pages than total HBM capacity. "
+                f"required={unique_required_pages}, capacity={self.config.cache.hbm_capacity_pages}"
+            )
+
+    def _apply_budget_and_eviction_policy(
+        self,
+        step: WorkloadStep,
+        decision: PolicyOutput,
+        metrics: StepMetrics,
+        evicted_pages: list[KVPageId],
+    ) -> None:
+        """Apply controller-chosen budgets and explicit evictions."""
+        self.state.apply_layer_budgets(decision.layer_budgets)
+        self._enforce_layer_budgets(step.required_pages, metrics, evicted_pages)
+        self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
+
+    def _prefetch_decision_pages(
+        self,
+        step: WorkloadStep,
+        decision: PolicyOutput,
+        metrics: StepMetrics,
+        prefetched_pages: list[KVPageId],
+        evicted_pages: list[KVPageId],
+    ) -> None:
+        """Submit controller-chosen prefetches when capacity allows."""
+        for page in decision.prefetch_pages:
+            if self.state.has_resident(page) or self.state.has_inflight(page):
+                continue
+            self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
+            if len(self.state.resident_pages) + len(self.state.inflight_pages) >= self.config.cache.hbm_capacity_pages:
+                continue
+            self.scheduler.submit(page, TransferKind.PREFETCH, self.state, metrics)
+            metrics.prefetch_submitted += 1
+            prefetched_pages.append(page)
+
+    def _submit_required_pages(
+        self,
+        step: WorkloadStep,
+        decision: PolicyOutput,
+        metrics: StepMetrics,
+        demand_miss_pages: list[KVPageId],
+        evicted_pages: list[KVPageId],
+    ) -> int:
+        """Ensure every required page is resident or in flight."""
+        demand_misses = 0
+        for page in step.required_pages:
+            if self.state.has_resident(page) or self.state.has_inflight(page):
+                continue
+            self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
+            if len(self.state.resident_pages) + len(self.state.inflight_pages) >= self.config.cache.hbm_capacity_pages:
+                self._evict_if_needed(step.required_pages, PolicyOutput(), metrics, evicted_pages)
+            self.scheduler.submit(page, TransferKind.DEMAND, self.state, metrics)
+            demand_misses += 1
+            demand_miss_pages.append(page)
+        return demand_misses
+
+    def _verify_required_pages_ready(self, step: WorkloadStep) -> None:
+        """Enforce the core simulator invariant: decode only launches on-resident pages."""
+        missing_residency = [page for page in step.required_pages if page not in self.state.resident_pages]
+        if missing_residency:
+            raise RuntimeError(f"Decode launch attempted before residency was ready: {missing_residency}")
+        missing_slots = [page for page in step.required_pages if page not in self.state.page_to_slot]
+        if missing_slots:
+            raise RuntimeError(f"Decode launch attempted without HBM slot assignment: {missing_slots}")
+
+    def _record_page_accesses(self, step: WorkloadStep, accessed_pages: list[KVPageId]) -> None:
+        """Mark the step's required pages as accessed once decode can legally run."""
+        for page in step.required_pages:
+            self.state.mark_access(page, step.step_idx)
+            accessed_pages.append(page)
+
+    def _finalize_metrics(
+        self,
+        metrics: StepMetrics,
+        demand_misses: int,
+        demand_miss_pages: list[KVPageId],
+        prefetched_pages: list[KVPageId],
+        evicted_pages: list[KVPageId],
+        accessed_pages: list[KVPageId],
+    ) -> None:
+        """Write final page-wise and transfer-wise summaries into `StepMetrics`."""
+        metrics.demand_misses = demand_misses
+        metrics.inflight_transfers = self.scheduler.inflight_count()
+        metrics.transfer_backlog = self.state.transfer_state.backlog
+        metrics.churn = self.state.churn
+        metrics.demand_miss_pages = tuple(demand_miss_pages)
+        metrics.prefetched_pages = tuple(prefetched_pages)
+        metrics.evicted_pages = tuple(evicted_pages)
+        metrics.accessed_pages = tuple(accessed_pages)
+        metrics.resident_pages_end = tuple(sorted(self.state.resident_pages))
 
     def _evict_if_needed(
         self,
@@ -165,13 +258,19 @@ class OverlapAwareSimulator:
                     evicted_pages.append(victim)
 
     def run_step(self, step: WorkloadStep, controller: ResidencyController) -> StepMetrics:
-        """Run one decode step from controller decision to decode completion."""
+        """Run one decode step.
 
-        # First, let any transfers that should already be complete become
-        # visible in the state.
+        The intended reading order is:
+        1. complete any already-finished transfers
+        2. ask the controller for a page-management decision
+        3. apply evictions / budgets / prefetches
+        4. guarantee required pages are present
+        5. launch decode only after the required set is resident
+        6. record page-wise statistics
+        """
+
+        self._check_step_feasible(step)
         self.scheduler.advance_to(self.scheduler.now_ms, self.state)
-
-        # Initialize metric storage for this step.
         metrics = StepMetrics(
             step_idx=step.step_idx,
             required_pages=len(step.required_pages),
@@ -182,75 +281,23 @@ class OverlapAwareSimulator:
         evicted_pages: list[KVPageId] = []
         accessed_pages: list[KVPageId] = []
 
-        # Ask the controller what to do, given the current system state.
         context = self._make_context(step)
         decision = controller.decide(context)
-
-        # Apply any layer budget changes first so later policy logic can honor
-        # the new budget picture.
-        self.state.apply_layer_budgets(decision.layer_budgets)
-        self._enforce_layer_budgets(step.required_pages, metrics, evicted_pages)
-        self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
-
-        # Submit proactive prefetches chosen by the controller.
-        for page in decision.prefetch_pages:
-            if self.state.has_resident(page) or self.state.has_inflight(page):
-                continue
-            self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
-            if len(self.state.resident_pages) + len(self.state.inflight_pages) >= self.config.cache.hbm_capacity_pages:
-                continue
-            self.scheduler.submit(page, TransferKind.PREFETCH, self.state, metrics)
-            metrics.prefetch_submitted += 1
-            prefetched_pages.append(page)
-
-        # Now guarantee the current step's required pages are on the way.
-        demand_misses = 0
-        for page in step.required_pages:
-            if self.state.has_resident(page):
-                self.state.mark_access(page, step.step_idx)
-                continue
-            if not self.state.has_inflight(page):
-                self._evict_if_needed(step.required_pages, decision, metrics, evicted_pages)
-                if len(self.state.resident_pages) + len(self.state.inflight_pages) >= self.config.cache.hbm_capacity_pages:
-                    # Final safety valve: if we are still full, fall back to the
-                    # simulator's default eviction behavior.
-                    self._evict_if_needed(step.required_pages, PolicyOutput(), metrics, evicted_pages)
-                self.scheduler.submit(page, TransferKind.DEMAND, self.state, metrics)
-                demand_misses += 1
-                demand_miss_pages.append(page)
-
-        metrics.demand_misses = demand_misses
-
-        # The decode step must wait until every required page is actually ready.
+        self._apply_budget_and_eviction_policy(step, decision, metrics, evicted_pages)
+        self._prefetch_decision_pages(step, decision, metrics, prefetched_pages, evicted_pages)
+        demand_misses = self._submit_required_pages(step, decision, metrics, demand_miss_pages, evicted_pages)
         self.scheduler.wait_for_pages(step.required_pages, self.state, metrics)
-
-        # Engine-level correctness invariant:
-        # the decode kernel is only allowed to launch after every required page
-        # is resident in HBM and mapped to a slot.
-        missing_residency = [page for page in step.required_pages if page not in self.state.resident_pages]
-        if missing_residency:
-            raise RuntimeError(f"Decode launch attempted before residency was ready: {missing_residency}")
-        missing_slots = [page for page in step.required_pages if page not in self.state.page_to_slot]
-        if missing_slots:
-            raise RuntimeError(f"Decode launch attempted without HBM slot assignment: {missing_slots}")
-
-        # Once the pages are available, the current step touches them.
-        for page in step.required_pages:
-            self.state.mark_access(page, step.step_idx)
-            accessed_pages.append(page)
-
-        # Run the simulated decode kernel and allow overlap with background copy.
+        self._verify_required_pages_ready(step)
+        self._record_page_accesses(step, accessed_pages)
         self.scheduler.overlap_compute(self.state, metrics)
-
-        # Record some end-of-step state summaries.
-        metrics.inflight_transfers = self.scheduler.inflight_count()
-        metrics.transfer_backlog = self.state.transfer_state.backlog
-        metrics.churn = self.state.churn
-        metrics.demand_miss_pages = tuple(demand_miss_pages)
-        metrics.prefetched_pages = tuple(prefetched_pages)
-        metrics.evicted_pages = tuple(evicted_pages)
-        metrics.accessed_pages = tuple(accessed_pages)
-        metrics.resident_pages_end = tuple(sorted(self.state.resident_pages))
+        self._finalize_metrics(
+            metrics,
+            demand_misses,
+            demand_miss_pages,
+            prefetched_pages,
+            evicted_pages,
+            accessed_pages,
+        )
         self.state.register_miss_batch(demand_misses, len(step.required_pages))
         controller.observe(context, decision, metrics)
         return metrics

@@ -45,17 +45,20 @@ from .policies import (
 )
 from .replay import load_trace_json, save_trace_json, trace_to_json_rows
 from .scoring import (
+    attach_reuse_distance_features,
     HeadActivityRecomputedScorer,
     LayerNormalizedHeadActivityScorer,
     NormalizedHeadWeightedScorer,
+    PageStatsHybridScorer,
     PassthroughHeadWeightedScorer,
     PredictedBoostedHeadActivityScorer,
+    ReuseDistanceHybridScorer,
     apply_scorer_to_trace,
 )
 from .score_diagnostics import diagnose_trace_scores
 from .scheduler import OverlapTransferScheduler
 from .simulator import OverlapAwareSimulator
-from .stats import summarize_page_tile_stats, write_rows_csv
+from .stats import summarize_page_tile_stats, summarize_realism_metrics, write_rows_csv
 from .state import CacheState
 from .trace_transforms import (
     convert_trace_recent_threshold,
@@ -87,6 +90,7 @@ __all__ = [
     "AggregateBenchmarkResult",
     "BenchmarkResult",
     "aggregate_policy_summaries",
+    "attach_reuse_distance_features",
     "benchmark_policies",
     "benchmark_policies_across_seeds",
     "build_bandit_action_menu",
@@ -108,11 +112,13 @@ __all__ = [
     "load_trace_json",
     "LRUController",
     "NormalizedHeadWeightedScorer",
+    "PageStatsHybridScorer",
     "OverlapTransferScheduler",
     "OverlapAwareSimulator",
     "PassthroughHeadWeightedScorer",
     "PerfectPrefetchOracleController",
     "PredictedBoostedHeadActivityScorer",
+    "ReuseDistanceHybridScorer",
     "PolicyDecision",
     "PolicyOutput",
     "qtile",
@@ -125,6 +131,7 @@ __all__ = [
     "save_trace_json",
     "SimulationConfig",
     "summarize_page_tile_stats",
+    "summarize_realism_metrics",
     "StepMetrics",
     "SyntheticTraceConfig",
     "SyntheticTraceGenerator",

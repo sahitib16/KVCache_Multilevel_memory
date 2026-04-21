@@ -14,8 +14,11 @@ from kv_controller import (
     FutureTraceOracle,
     HeadActivityRecomputedScorer,
     LayerNormalizedHeadActivityScorer,
+    PageStatsHybridScorer,
+    ReuseDistanceHybridScorer,
     ContextualBanditController,
     BeladyOracleController,
+    attach_reuse_distance_features,
     apply_scorer_to_trace,
     benchmark_policies_across_seeds,
     benchmark_policies,
@@ -40,6 +43,7 @@ from kv_controller import (
     load_trace_json,
     save_trace_json,
     summarize_page_tile_stats,
+    summarize_realism_metrics,
 )
 
 
@@ -261,6 +265,37 @@ def test_apply_scorer_to_trace_updates_head_weighted_score_field():
     assert rescored[0].per_page_features[sample_page]["head_weighted_score"] == rescored[0].head_weighted_scores[sample_page]
 
 
+def test_attach_reuse_distance_features_adds_expected_fields():
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+    sample_page = next(iter(trace[1].per_page_features))
+    features = trace[1].per_page_features[sample_page]
+    assert "reuse_distance" in features
+    assert "reuse_distance_inverse" in features
+    assert "reuse_distance_short" in features
+    assert "reuse_distance_long" in features
+    assert "reuse_distance_mavg" in features
+    assert "request_reuse_distance_inverse" in features
+    assert "page_recent_frequency" in features
+    assert "request_page_recent_frequency" in features
+    assert "tile_recent_frequency" in features
+
+
+def test_reuse_distance_hybrid_scorer_uses_reuse_features():
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+    scorer = ReuseDistanceHybridScorer(alpha=1.0, beta=0.5)
+    scores = scorer.score_step(trace[1])
+    assert scores
+    assert any(score >= 0.0 for score in scores.values())
+
+
+def test_page_stats_hybrid_scorer_uses_causal_hotness_features():
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+    scorer = PageStatsHybridScorer()
+    scores = scorer.score_step(trace[1])
+    assert scores
+    assert any(score >= 0.0 for score in scores.values())
+
+
 def test_page_and_tile_stats_aggregate_pagewise_behavior():
     trace = make_trace(steps=4)
     sim = make_sim(hbm_capacity_pages=8)
@@ -274,6 +309,19 @@ def test_page_and_tile_stats_aggregate_pagewise_behavior():
     assert sum(int(row["access_count"]) for row in page_rows) == sum(len(step.required_pages) for step in trace)
     assert sum(int(row["access_count"]) for row in layer_rows) == sum(len(step.required_pages) for step in trace)
     assert sum(int(row["access_count"]) for row in tile_rows) == sum(len(step.required_pages) for step in trace)
+
+
+def test_realism_metrics_return_expected_summary_fields():
+    trace = make_trace(steps=4)
+    sim = make_sim(hbm_capacity_pages=8)
+    metrics = sim.run(trace, PredictedPrefetchController(k=2))
+    page_rows, layer_rows, tile_rows = summarize_page_tile_stats(trace, metrics, tile_size_pages=2)
+    realism = summarize_realism_metrics(page_rows, layer_rows, tile_rows)
+
+    assert "page_miss_rate" in realism
+    assert "prefetch_hit_rate" in realism
+    assert "hot_page_access_share_top10pct" in realism
+    assert "hot_tile_access_share_top10pct" in realism
 
 
 def test_score_based_controller_prefetches_from_predicted_pages():

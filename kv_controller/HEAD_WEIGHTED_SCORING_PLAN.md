@@ -20,10 +20,13 @@ We want a head-weighted score that is useful for control decisions:
 - eventually adaptive action selection
 
 The score is valuable only if it improves control outcomes such as:
-- lower stall
 - lower misses
 - lower churn
-- better tail latency
+- better prefetch usefulness
+- lower harmful eviction / miss pressure
+
+Timing can still be observed, but for this project phase the main validation
+target is page-level behavior rather than simulated milliseconds.
 
 ## Step 1: Define And Preserve The Raw Head Signal
 
@@ -74,6 +77,13 @@ We should log:
 - which pages were scored highly but still evicted
 - which prefetched pages were useful vs wasted
 - how score rank correlates with next-step usage
+- page-wise / tile-wise realism summaries:
+  - hot-page concentration
+  - hot-tile concentration
+  - page miss rate
+  - prefetch hit / waste rate
+  - eviction-per-access rate
+  - reuse-distance summaries
 
 Why:
 - this tells us whether a score is informative or just numerically noisy
@@ -177,23 +187,28 @@ Completed so far:
 - Step 3 is effectively done for the first scorer family:
   - multiple score adapters exist
   - replay-time scorer comparisons are now possible
-- Step 4 is now in progress:
+- Step 4 is now effectively done for the current analytic scorer family:
   - diagnostics script exists for score distributions and next-step hit rates
+  - realism validation script now exists for page-wise / tile-wise workload checks
 - Step 6 is in progress:
   - real head-summary traces can now be collected from:
     - manually supplied prompts
     - public prompt datasets through the dataset collector
+ - Step 3 has now entered the first novelty extension:
+   - reuse-distance features can be attached to replay traces
+   - a reuse-distance hybrid scorer now exists for controlled comparison
 
 Current replay-time default:
-- scorer view: `LayerNormalizedHeadActivityScorer` for the current main replay benchmark
-  - broader real-benchmark comparisons now show this is the strongest current
-    scorer view for the bandit on both the main benchmark and the hard stress test
+- scorer view: `NormalizedHeadWeightedScorer`
+  - larger public-dataset validation now favors `normalized` as the strongest
+    current replay-time default on control outcomes
 - bandit action menu: `full`
   - broader replay studies favored the full menu over the trimmed menu
 
 Next:
-- broaden replay-time scorer studies further using public prompt datasets
-- run diagnostics on those broader traces and confirm whether
-  `layer_normalized` remains the best main scorer view
-- decide whether the direct analytic scorer is strong enough or whether a
-  learned predictor is needed later
+- use the page/tile realism validator as a gate before trusting new replay
+  workloads
+- keep the analytic scorer path unless broader evidence clearly says it is too weak
+- compare the new reuse-distance hybrid against the current normalized default
+- only consider a learned predictor later if the analytic scorer family stops
+  improving controller outcomes

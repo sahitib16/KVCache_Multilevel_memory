@@ -22,11 +22,14 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from kv_controller import (
+    attach_reuse_distance_features,
     HeadActivityRecomputedScorer,
     LayerNormalizedHeadActivityScorer,
     NormalizedHeadWeightedScorer,
+    PageStatsHybridScorer,
     PassthroughHeadWeightedScorer,
     PredictedBoostedHeadActivityScorer,
+    ReuseDistanceHybridScorer,
     apply_scorer_to_trace,
     diagnose_trace_scores,
     load_trace_json,
@@ -46,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    traces = [load_trace_json(path.strip()) for path in args.trace_jsons.split(",") if path.strip()]
+    traces = [attach_reuse_distance_features(load_trace_json(path.strip())) for path in args.trace_jsons.split(",") if path.strip()]
 
     scorers = {
         "passthrough": PassthroughHeadWeightedScorer(),
@@ -54,6 +57,8 @@ def main() -> None:
         "recomputed": HeadActivityRecomputedScorer(),
         "layer_normalized": LayerNormalizedHeadActivityScorer(),
         "predicted_boosted": PredictedBoostedHeadActivityScorer(),
+        "reuse_hybrid": ReuseDistanceHybridScorer(),
+        "page_stats_hybrid": PageStatsHybridScorer(),
     }
 
     for scorer_name, scorer in scorers.items():

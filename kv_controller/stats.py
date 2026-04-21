@@ -204,6 +204,67 @@ def summarize_page_tile_stats(
     return page_rows, layer_rows, tile_rows
 
 
+def summarize_realism_metrics(
+    page_rows: list[dict[str, object]],
+    layer_rows: list[dict[str, object]],
+    tile_rows: list[dict[str, object]],
+) -> dict[str, float]:
+    """Summarize whether a replay workload looks meaningfully page-structured.
+
+    These metrics are not a claim of external truth. They are sanity checks for
+    whether a workload is producing:
+    - hot vs cold pages
+    - nontrivial reuse
+    - eviction pressure
+    - useful vs wasteful prefetch
+    - meaningful layer/tile concentration
+    """
+
+    total_access = float(sum(int(row["access_count"]) for row in page_rows))
+    total_miss = float(sum(int(row["demand_miss_count"]) for row in page_rows))
+    total_prefetch = float(sum(int(row["prefetch_submit_count"]) for row in page_rows))
+    total_prefetch_hit = float(sum(int(row["prefetch_hit_count"]) for row in page_rows))
+    total_prefetch_waste = float(sum(int(row["prefetch_wasted_count"]) for row in page_rows))
+    total_evictions = float(sum(int(row["eviction_count"]) for row in page_rows))
+    total_resident_steps = float(sum(int(row["resident_steps"]) for row in page_rows))
+
+    def _top_share(rows: list[dict[str, object]], key: str) -> float:
+        if not rows:
+            return 0.0
+        ordered = sorted((float(row[key]) for row in rows), reverse=True)
+        top_n = max(1, round(0.1 * len(ordered)))
+        denom = sum(ordered)
+        return (sum(ordered[:top_n]) / denom) if denom > 0 else 0.0
+
+    reuse_values = [
+        float(row["mean_reuse_distance"])
+        for row in page_rows
+        if float(row["mean_reuse_distance"]) > 0.0
+    ]
+    layer_accesses = [float(row["access_count"]) for row in layer_rows]
+
+    return {
+        "unique_pages_touched": float(len(page_rows)),
+        "unique_tiles_touched": float(len(tile_rows)),
+        "page_miss_rate": (total_miss / total_access) if total_access > 0 else 0.0,
+        "prefetch_hit_rate": (total_prefetch_hit / total_prefetch) if total_prefetch > 0 else 0.0,
+        "prefetch_waste_rate": (total_prefetch_waste / total_prefetch) if total_prefetch > 0 else 0.0,
+        "evictions_per_access": (total_evictions / total_access) if total_access > 0 else 0.0,
+        "mean_resident_steps_per_page": (total_resident_steps / len(page_rows)) if page_rows else 0.0,
+        "mean_page_reuse_distance": _safe_mean(reuse_values),
+        "short_reuse_fraction": (
+            sum(int(row["short_reuse_count"]) for row in page_rows)
+            / max(
+                1,
+                sum(int(row["short_reuse_count"]) + int(row["long_reuse_count"]) for row in page_rows),
+            )
+        ),
+        "hot_page_access_share_top10pct": _top_share(page_rows, "access_count"),
+        "hot_tile_access_share_top10pct": _top_share(tile_rows, "access_count"),
+        "layer_access_share_max": (max(layer_accesses) / sum(layer_accesses)) if layer_accesses else 0.0,
+    }
+
+
 def write_rows_csv(path: str, rows: list[dict[str, object]]) -> None:
     if not rows:
         return

@@ -1804,3 +1804,312 @@ Interpretation:
 - this does not make the simulator a precise vLLM model
 - it does make the simulator cleaner, more verifiable, and better aligned with
   the project's page-statistics-first framing
+
+2026-04-13 - Closing The Head-Scoring Track And Starting Reuse-Aware Scoring
+----------------------------------------------------------------------------
+
+Goal of this round:
+- finish the head-weighted scoring track cleanly enough to stop debating scorer
+  basics
+- add a page/tile realism gate so replay workloads can be judged as useful or
+  misleading
+- start the next novelty phase with reuse-distance-aware scoring
+
+What was implemented:
+- new reuse-distance feature attachment in `scoring.py`
+  - `attach_reuse_distance_features(trace)`
+  - adds:
+    - `reuse_distance`
+    - `reuse_distance_inverse`
+    - `reuse_distance_short`
+    - `reuse_distance_long`
+    - `reuse_distance_mavg`
+- new scorer:
+  - `ReuseDistanceHybridScorer`
+  - formula:
+    - `score = alpha * normalized_head_score + beta * inverse_reuse_distance`
+- new realism summary in `stats.py`
+  - `summarize_realism_metrics(...)`
+  - reports:
+    - page miss rate
+    - prefetch hit / waste rate
+    - evictions per access
+    - mean resident steps per page
+    - mean page reuse distance
+    - short-reuse fraction
+    - hot-page access share
+    - hot-tile access share
+    - layer access share max
+- new script:
+  - `scripts/validate_replay_realism.py`
+  - purpose:
+    - validate whether a replay workload is actually producing meaningful
+      page-level structure
+    - compare `normalized`, `layer_normalized`, and `reuse_hybrid` under the
+      same replay trace
+- updated:
+  - `scripts/evaluate_replay_scores.py`
+  - `scripts/diagnose_replay_scores.py`
+  so reuse-distance features are attached before scorer comparison
+
+Validation:
+- `pytest tests/test_kv_controller_core.py`
+  - result: `33 passed`
+- `python -m py_compile kv_controller/*.py scripts/evaluate_replay_scores.py scripts/diagnose_replay_scores.py scripts/validate_replay_realism.py`
+  - passed
+
+Smoke-test command:
+`python scripts/validate_replay_realism.py --trace-json results/dataset_head_traces/pressure_16/recent_threshold_round_robin_interleave.json --hbm-capacity-pages 32 --policy score --scorers normalized,layer_normalized,reuse_hybrid`
+
+Smoke-test realism output on the current main benchmark:
+- `unique_pages_touched`: `480`
+- `unique_tiles_touched`: `204`
+- `page_miss_rate`: `1.0000`
+- `prefetch_hit_rate`: `0.0000`
+- `prefetch_waste_rate`: `1.0000`
+- `evictions_per_access`: `1.0101`
+- `mean_page_reuse_distance`: `16.9806`
+- `hot_page_access_share_top10pct`: `0.1386`
+- `hot_tile_access_share_top10pct`: `0.1215`
+
+Interpretation:
+- the current main replay benchmark is clearly not trivial
+- it is actually extremely harsh for the plain score-based policy:
+  - every touched page misses
+  - all prefetches are wasted under this setting
+  - evictions roughly match accesses
+- this is exactly the kind of evidence we needed to know whether a workload is
+  too easy or too hard
+- the realism gate is now a useful research check between infrastructure work
+  and novelty claims
+
+Research-focus implication:
+- before claiming a new scorer or controller is better, we can now ask:
+  - was it tested on a replay workload with meaningful page pressure?
+  - was there real hot/cold structure at the page or tile level?
+  - was the workload neither trivial nor completely degenerate?
+
+Current decision:
+- keep `normalized` as the replay-time default scorer
+- treat head-scoring infrastructure as sufficiently complete for the next phase
+- start reuse-distance-aware scoring as the first novelty extension
+
+2026-04-18 - Reuse-Hybrid vs Normalized On Main And Hard Replay Benchmarks
+----------------------------------------------------------------------------
+
+Goal:
+- evaluate the first reuse-distance-aware scorer against the current normalized
+  head-score default
+- test on both:
+  - main benchmark: `recent_threshold_round_robin_interleave`
+  - hard stress benchmark: dense `round_robin_interleave`
+
+Main benchmark:
+- trace:
+  `results/dataset_head_traces/pressure_16/recent_threshold_round_robin_interleave.json`
+- HBM capacity: `32`
+
+Score policy:
+- all scorer variants had:
+  - total_miss `4155`
+  - mean_stall `2.9995`
+  - p95_stall `3.5100`
+  - prefetch `74`
+  - evictions `4197`
+
+Bandit + normalized:
+- total_miss `4155`
+- mean_stall `2.9517`
+- p95_stall `3.5100`
+- prefetch `24`
+- evictions `4147`
+
+Bandit + reuse_hybrid:
+- total_miss `4155`
+- mean_stall `2.9728`
+- p95_stall `3.5100`
+- prefetch `37`
+- evictions `4160`
+
+Main benchmark interpretation:
+- reuse_hybrid does not beat normalized
+- both match misses, but normalized gives lower mean stall and less movement
+- normalized remains the better default on the main benchmark
+
+Hard stress benchmark:
+- trace:
+  `results/dataset_head_traces/pressure_16/round_robin_interleave.json`
+- HBM capacity: `60`
+
+Score policy:
+- all scorer variants had:
+  - total_miss `5364`
+  - mean_stall `4.0416`
+  - p95_stall `6.4800`
+  - prefetch `384`
+  - evictions `5688`
+
+Bandit + normalized:
+- total_miss `5405`
+- mean_stall `4.0359`
+- p95_stall `6.4800`
+- prefetch `345`
+- evictions `5690`
+
+Bandit + reuse_hybrid:
+- total_miss `5481`
+- mean_stall `4.0359`
+- p95_stall `6.4800`
+- prefetch `269`
+- evictions `5690`
+
+Hard benchmark interpretation:
+- reuse_hybrid is worse than normalized on misses
+- it reaches the same mean stall only by being more conservative and
+  prefetching less
+- this confirms that the current reuse-distance formula is not yet an
+  improvement over normalized head score
+
+Score diagnostics:
+- normalized:
+  - mean_reused_page_rank `0.4132`
+- reuse_hybrid:
+  - mean_reused_page_rank `0.4214`
+- lower is better, so diagnostics also favor normalized
+
+Decision:
+- keep `normalized` as the default scorer
+- keep reuse_hybrid as an experimental baseline, not the default
+- do not claim reuse-distance-aware scoring is beneficial yet
+
+Next reuse-distance work:
+- the current reuse feature is too weak for these traces because the benchmark
+  has long reuse distances and no short-reuse signal
+- next version should use:
+  - reuse-distance buckets
+  - page hotness / frequency
+  - request-aware reuse rather than only global last-access distance
+
+2026-04-18 - Richer Page-Stats Hybrid Scorer And vLLM Trace-Capture Start
+-------------------------------------------------------------------------
+
+Goal:
+- improve the reuse-aware scorer beyond raw inverse reuse distance
+- test whether richer causal page statistics help on the main and hard replay
+  benchmarks
+- begin vLLM trace-capture work without claiming live integration
+
+New scorer:
+- `PageStatsHybridScorer`
+- formula combines:
+  - normalized head score
+  - request-aware inverse reuse distance
+  - recent global page frequency
+  - recent per-request page frequency
+  - recent tile hotness
+- all features are causal and computed from previous accesses only
+
+New features attached by `attach_reuse_distance_features(...)`:
+- `request_reuse_distance`
+- `request_reuse_distance_inverse`
+- `request_reuse_distance_short`
+- `request_reuse_distance_long`
+- `page_recent_frequency`
+- `request_page_recent_frequency`
+- `tile_recent_frequency`
+- `tile_id`
+
+Main benchmark:
+- trace:
+  `results/dataset_head_traces/pressure_16/recent_threshold_round_robin_interleave.json`
+- HBM capacity: `32`
+
+Bandit + normalized:
+- total_miss `4155`
+- mean_stall `2.9517`
+- p95_stall `3.5100`
+- prefetch `24`
+- evictions `4147`
+
+Bandit + page_stats_hybrid:
+- total_miss `4155`
+- mean_stall `2.9770`
+- p95_stall `3.5100`
+- prefetch `46`
+- evictions `4169`
+
+Main benchmark interpretation:
+- page_stats_hybrid does not beat normalized on the main benchmark
+- it preserves misses but increases movement and mean stall
+- normalized remains the best default for this benchmark
+
+Hard stress benchmark:
+- trace:
+  `results/dataset_head_traces/pressure_16/round_robin_interleave.json`
+- HBM capacity: `60`
+
+Bandit + normalized:
+- total_miss `5405`
+- mean_stall `4.0359`
+- p95_stall `6.4800`
+- prefetch `345`
+- evictions `5690`
+
+Bandit + page_stats_hybrid:
+- total_miss `5180`
+- mean_stall `3.8827`
+- p95_stall `6.4800`
+- prefetch `568`
+- evictions `5688`
+
+Hard benchmark interpretation:
+- page_stats_hybrid is the first reuse-aware scorer that clearly helps in a
+  hard regime
+- it reduces misses by `225` vs normalized and improves mean stall by about
+  `0.1532`
+- the tradeoff is much more aggressive prefetching
+- this is a promising novelty signal, but not yet a universal default
+
+Page/tile realism checks:
+- main benchmark under score policy:
+  - page_miss_rate `1.0000`
+  - prefetch_hit_rate `0.0000`
+  - prefetch_waste_rate `1.0000`
+  - evictions_per_access `1.0101`
+- hard benchmark under score policy:
+  - page_miss_rate `0.9332`
+  - prefetch_hit_rate `1.0000`
+  - prefetch_waste_rate `0.0000`
+  - evictions_per_access `0.9896`
+
+Interpretation of realism checks:
+- the main benchmark is extremely harsh and prefetch-hostile for the score
+  policy
+- the hard benchmark has more useful prefetch structure and is where
+  page_stats_hybrid helps
+- this supports the research point that different strategies work best under
+  different page-pressure regimes
+
+vLLM trace-capture start:
+- added `VLLM_TRACE_CAPTURE_PLAN.md`
+- added `scripts/probe_vllm_trace_points.py`
+- current local environment result:
+  - `vllm` is not installed
+  - probe reports missing modules cleanly
+
+vLLM research notes:
+- current vLLM v1 docs describe KV cache around `KVCacheBlock`, `KVCacheManager`,
+  `BlockTable`, and `MultiGroupBlockTable`
+- relevant public concepts include:
+  - `block_id`
+  - `block_hash`
+  - `ref_cnt`
+  - request-to-block mappings
+  - block tables and slot mappings
+  - possible difference between allocation block size and kernel block size
+
+Next vLLM step:
+- install or use an environment with vLLM
+- run `python scripts/probe_vllm_trace_points.py`
+- then add shadow logging around block allocation, block-table commit, and
+  block free/evict events

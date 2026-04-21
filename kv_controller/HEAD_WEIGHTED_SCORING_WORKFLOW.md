@@ -457,9 +457,30 @@ This script reports:
 - top-k next-step hit rates
 - reused-page rank summary
 
+The repo also includes:
+
+[`validate_replay_realism.py`](/home/sbulusu31/kv_multilevel/scripts/validate_replay_realism.py)
+
+This script reports:
+- page miss rate
+- prefetch hit / waste rate
+- eviction-per-access rate
+- hot-page and hot-tile concentration
+- reuse-distance summaries
+
 ### Run diagnostics on the dataset-backed benchmarks
 
 ```bash
 python scripts/diagnose_replay_scores.py \
   --trace-jsons results/dataset_head_traces/pressure/recent_threshold_round_robin_interleave.json,results/dataset_head_traces/pressure/round_robin_interleave.json
+```
+
+### Validate whether a replay workload is a useful page-level benchmark
+
+```bash
+python scripts/validate_replay_realism.py \
+  --trace-json results/dataset_head_traces/pressure_16/recent_threshold_round_robin_interleave.json \
+  --hbm-capacity-pages 32 \
+  --policy score \
+  --scorers normalized,layer_normalized,reuse_hybrid
 ```

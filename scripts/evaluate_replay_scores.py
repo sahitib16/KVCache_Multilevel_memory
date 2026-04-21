@@ -23,6 +23,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from kv_controller import (
+    attach_reuse_distance_features,
     build_bandit_action_menu,
     CacheConfig,
     ContextualBanditController,
@@ -31,8 +32,10 @@ from kv_controller import (
     LRUController,
     NormalizedHeadWeightedScorer,
     OverlapAwareSimulator,
+    PageStatsHybridScorer,
     PassthroughHeadWeightedScorer,
     PredictedBoostedHeadActivityScorer,
+    ReuseDistanceHybridScorer,
     ScoreBasedController,
     SimulationConfig,
     SyntheticTraceConfig,
@@ -196,6 +199,7 @@ def print_aggregate_results(label: str, summaries: list[dict[str, object]]) -> N
 def main() -> None:
     args = build_parser().parse_args()
     base_trace = build_or_load_trace(args)
+    base_trace = attach_reuse_distance_features(base_trace)
     policy_names = [name.strip() for name in args.policies.split(",") if name.strip()]
     bandit_menus = [name.strip() for name in args.bandit_menus.split(",") if name.strip()]
 
@@ -205,6 +209,8 @@ def main() -> None:
         "recomputed": HeadActivityRecomputedScorer(),
         "layer_normalized": LayerNormalizedHeadActivityScorer(),
         "predicted_boosted": PredictedBoostedHeadActivityScorer(),
+        "reuse_hybrid": ReuseDistanceHybridScorer(),
+        "page_stats_hybrid": PageStatsHybridScorer(),
     }
 
     if args.seed_list:

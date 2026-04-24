@@ -14,6 +14,254 @@ Build an overlap-aware multi-tier KV page residency controller that:
 - does not modify fused attention kernels
 - minimizes decode stall and tail latency when KV spills between CPU and GPU
 
+## Latest Update: Fixed Policies, Regime-Aware Scoring, and Realism Gates
+
+### What We Added
+- Broadened the fixed-policy family in `kv_controller/policies.py`:
+  - `FixedKPrefetchController`
+  - `SlidingWindowController`
+  - `TileHotnessController`
+- Added richer reuse/page-history features in `kv_controller/scoring.py`:
+  - request-local reuse distance
+  - recent per-page frequency
+  - recent per-request page frequency
+  - recent tile frequency
+- Added:
+  - `PageStatsHybridScorer`
+  - `RegimeAwarePageStatsScorer`
+- Integrated realism gates through `scripts/validate_replay_realism.py`.
+
+### Realism-Gate Results
+
+Main benchmark:
+- Trace: `results/dataset_head_traces/pressure_16/recent_threshold_round_robin_interleave.json`
+- Capacity: `32`
+- Under `score`:
+  - `page_miss_rate = 1.0000`
+  - `prefetch_hit_rate = 0.0000`
+  - `prefetch_waste_rate = 1.0000`
+  - `evictions_per_access = 1.0101`
+
+Interpretation:
+- this benchmark is strongly prefetch-hostile
+- it is still useful, but should not be the only workload used for claims
+
+Hard benchmark:
+- Trace: `results/dataset_head_traces/pressure_16/round_robin_interleave.json`
+- Capacity: `60`
+- Under `score`:
+  - `page_miss_rate = 0.9332`
+  - `prefetch_hit_rate = 1.0000`
+  - `prefetch_waste_rate = 0.0000`
+  - `evictions_per_access = 0.9896`
+
+Interpretation:
+- this benchmark has real repeated-access structure
+- aggressive reuse/page-history-aware prefetch can pay off here
+
+### Fixed-Policy Results
+
+Main benchmark:
+
+| policy | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `fixed_k_prefetch` | 4155 | 2.9995 | 74 | 4197 |
+| `sliding_window` | 4155 | 2.9995 | 74 | 4197 |
+| `tile_hotness` | 4155 | 2.9995 | 74 | 4197 |
+| `score` | 4155 | 2.9995 | 74 | 4197 |
+
+Interpretation:
+- the main benchmark does not separate the richer fixed-policy family
+
+Hard benchmark:
+
+| policy | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `fixed_k_prefetch` | 5368 | 4.0472 | 384 | 5692 |
+| `sliding_window` | 5376 | 4.0584 | 384 | 5700 |
+| `tile_hotness` | 5364 | 4.0416 | 384 | 5688 |
+| `score` | 5364 | 4.0416 | 384 | 5688 |
+
+Interpretation:
+- `tile_hotness` ties `score` on the hard benchmark
+- `fixed_k_prefetch` and `sliding_window` are slightly worse
+
+### Scorer Results
+
+Main benchmark (`bandit`):
+
+| scorer | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `normalized` | 4155 | 2.9517 | 24 | 4147 |
+| `page_stats_hybrid` | 4155 | 2.9770 | 46 | 4169 |
+| `regime_aware` | 4155 | 2.9784 | 49 | 4172 |
+
+Interpretation:
+- `normalized` is still best on the main prefetch-hostile benchmark
+- `regime_aware` is better than pure `page_stats_hybrid` on the main benchmark,
+  but it still gives back some of the `normalized` advantage
+
+Hard benchmark (`bandit`):
+
+| scorer | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `normalized` | 5405 | 4.0359 | 345 | 5690 |
+| `page_stats_hybrid` | 5180 | 3.8827 | 568 | 5688 |
+| `regime_aware` | 5174 | 3.8784 | 574 | 5688 |
+
+Interpretation:
+- `page_stats_hybrid` clearly wins on the hard benchmark
+- the improved `regime_aware` scorer now slightly beats `page_stats_hybrid`
+  on the hard benchmark
+- the remaining open problem is preserving the main-benchmark gains of
+  `normalized` at the same time
+
+### Thought Process And Failed Selector Ideas
+
+#### 1. Reuse-only trigger
+
+What we tried:
+- switch to the reuse/page-stats hybrid whenever average request-local inverse
+  reuse was high
+
+What failed:
+- both the main and hard benchmarks show strong request-local reuse
+- the selector therefore fired in both regimes
+- that made it too aggressive on the main benchmark
+
+What we learned:
+- reuse alone is not the right discriminator
+
+#### 2. Reuse plus predicted-page footprint
+
+What we tried:
+- switch only when both:
+  - request-local reuse was high
+  - predicted-page footprint was large
+
+What improved:
+- it matched the hard benchmark much better
+
+What still failed:
+- it was still too eager on the main benchmark
+- a few main-benchmark steps with large predicted-page sets were enough to
+  give back part of the `normalized` win
+
+What we learned:
+- predicted-page footprint matters more than reuse
+- but a single hard switch is still brittle
+
+#### 3. Soft blend between `normalized` and `page_stats_hybrid`
+
+What we tried:
+- blend the two scorers based on predicted footprint and working-set size
+
+What failed:
+- this preserved the main-benchmark result
+- but it threw away too much of the hard-benchmark gain
+
+What we learned:
+- the issue is not just "how much page-history signal to add"
+- the issue is "which steps should receive that signal at all"
+
+#### 4. Predicted footprint plus working-set threshold
+
+What we tried:
+- only switch when:
+  - predicted ratio was high
+  - required-page count was above a threshold
+
+What improved:
+- it protected the main benchmark better
+
+What failed:
+- it also removed too much of the hard-benchmark benefit
+
+What we learned:
+- absolute working-set size is useful context, but too coarse as a hard gate
+
+#### 5. Current best design
+
+What we now use:
+- `RegimeAwarePageStatsScorer`
+- trigger on large predicted-page footprint
+- when triggered, use a tuned high-pressure scorer with slightly softer
+  page-history weights than the standalone `PageStatsHybridScorer`
+
+Why this is better:
+- it stays interpretable
+- it uses causal step-local signals only
+- it now slightly improves the hard benchmark beyond the plain page-stats
+  hybrid
+
+Current outcome:
+- main benchmark:
+  - still worse than `normalized`
+  - but better than earlier regime-aware attempts
+- hard benchmark:
+  - now slightly better than `page_stats_hybrid`
+
+Honest conclusion:
+- the regime-aware direction is real
+- it is not fully solved yet
+- but it is now a meaningful novelty path rather than a placeholder
+
+## Three-Regime Benchmark Update
+
+To avoid overfitting the selector to only two extremes, we added a middle
+benchmark to the broader real-trace suite:
+
+- main:
+  `recent_threshold_round_robin_interleave`
+- middle:
+  `recent_topk_round_robin_interleave`
+- hard:
+  `round_robin_interleave`
+
+### Middle-Benchmark Realism
+
+Under `score`:
+- `page_miss_rate = 0.9283`
+- `prefetch_hit_rate = 0.0000`
+- `prefetch_waste_rate = 1.0000`
+- `evictions_per_access = 0.9383`
+- `mean_page_reuse_distance = 7.5651`
+- `short_reuse_fraction = 0.0815`
+
+Interpretation:
+- this is less hostile than the main benchmark
+- but still not as reuse-friendly as the dense hard stress benchmark
+- it gives us a bridge regime for scorer selection
+
+### Middle-Benchmark Scorer Results (`bandit`)
+
+| scorer | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `normalized` | 2150 | 2.9646 | 28 | 2154 |
+| `layer_normalized` | 2150 | 2.9484 | 24 | 2150 |
+| `page_stats_hybrid` | 2150 | 2.9673 | 32 | 2158 |
+| `regime_aware` | 2150 | 2.9646 | 28 | 2154 |
+
+Interpretation:
+- the middle benchmark does not favor the current regime-aware scorer
+- it behaves like `normalized` there
+- the best scorer in this bridge regime is `layer_normalized`
+
+### What This Changed
+
+The selector problem is now clearly a three-regime problem:
+- main benchmark best:
+  - `normalized`
+- middle benchmark best:
+  - `layer_normalized`
+- hard benchmark best:
+  - `regime_aware` / tuned page-history scorer
+
+This is actually a stronger research story than a single global scorer:
+- different scoring strategies are practical in different page-pressure regimes
+- the remaining challenge is making the regime selector itself robust and
+  interpretable
+
 ## Step 1: Reusable Simulator Core
 
 What we built:
@@ -2195,3 +2443,130 @@ Bandit + page_stats_hybrid:
 - install or use an environment with vLLM
 - run `python scripts/probe_vllm_trace_points.py`
 - then add shadow logging around block allocation, block-table commit, and block free/evict events
+
+## Unified Controller Design And Comparison
+
+Why this was necessary:
+- the actual end goal is one integrated controller inside a `vLLM`-like pipeline
+- not three separate permanent systems
+
+Design doc:
+- `kv_controller/UNIFIED_CONTROLLER_DESIGN.md`
+
+Implemented controller options:
+- `UnifiedRuleController`
+- `UnifiedBlendController`
+- `UnifiedBanditController`
+
+All three use the same controller interface:
+- one `decide(context) -> PolicyOutput`
+- one page-priority path
+- one eviction/prefetch decision point
+
+### Three-Regime Unified-Controller Comparison
+
+Main benchmark (`recent_threshold_round_robin_interleave`, capacity `32`)
+
+| policy | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `score` | 2181 | 3.0505 | 56 | 2213 |
+| `bandit` | 2181 | 3.0073 | 25 | 2181 |
+| `unified_rule` | 2181 | 3.0505 | 58 | 2215 |
+| `unified_blend` | 2181 | 3.0505 | 58 | 2215 |
+| `unified_bandit` | 2181 | 3.0424 | 39 | 2196 |
+
+Middle benchmark (`recent_topk_round_robin_interleave`, capacity `24`)
+
+| policy | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `score` | 2150 | 2.9889 | 47 | 2173 |
+| `bandit` | 2150 | 2.9619 | 30 | 2156 |
+| `unified_rule` | 2150 | 2.9889 | 49 | 2175 |
+| `unified_blend` | 2150 | 2.9889 | 49 | 2175 |
+| `unified_bandit` | 2150 | 2.9889 | 31 | 2157 |
+
+Hard benchmark (`round_robin_interleave`, capacity `84`)
+
+| policy | total_miss | mean_stall | prefetch | evictions |
+| --- | ---: | ---: | ---: | ---: |
+| `score` | 3258 | 4.6494 | 186 | 3366 |
+| `bandit` | 3295 | 4.6035 | 149 | 3366 |
+| `unified_rule` | 3072 | 4.3983 | 372 | 3366 |
+| `unified_blend` | 3072 | 4.3983 | 372 | 3366 |
+| `unified_bandit` | 3090 | 4.4145 | 354 | 3365 |
+
+### Interpretation
+
+- `UnifiedRuleController` and `UnifiedBlendController` are now the strongest
+  candidates for the final one-controller direction
+- they beat both `score` and the old contextual `bandit` by a large margin on
+  the hard benchmark
+- they do not yet improve the main or middle regimes
+- the improved `UnifiedBanditController` is now much stronger in the hard
+  regime and nearly matches the rule/blend controllers there
+
+### Current Bottom Line
+
+- the head-scoring idea is working
+- normalized head score is still strong in the hostile and middle regimes
+- we do not need a trained predictor yet for head scoring
+- reuse-aware scoring is working in the hard regime
+- we do not yet need training data for reuse either
+- the next bottleneck is controller/selector design, not lack of labels
+
+## Adaptive Unified-Controller Update
+
+### What Was Wrong Before
+
+The first `UnifiedBanditController` was too static in practice:
+- weak feature set
+- no delayed credit assignment
+- no meaningful warm start
+- too little action diversity
+
+Result:
+- it was too conservative and much worse than the rule/blend unified
+  controllers
+
+### What Changed
+
+- reused delayed-credit assignment from the older contextual bandit
+- added previous-step feedback features:
+  - previous stall
+  - previous misses
+  - previous evictions
+- expanded the action space across:
+  - scorer mode
+  - prefetch depth
+- added a heuristic prior / warm-start action from the current regime cues
+
+### New Unified-Bandit Results
+
+Main benchmark:
+- old unified-bandit:
+  - mean stall `3.0424`
+- improved unified-bandit:
+  - mean stall `3.0505`
+
+Middle benchmark:
+- old unified-bandit:
+  - mean stall `2.9889`
+- improved unified-bandit:
+  - mean stall `2.9889`
+
+Hard benchmark:
+- old unified-bandit:
+  - total miss `3349`
+  - mean stall `4.6494`
+  - prefetch `95`
+- improved unified-bandit:
+  - total miss `3090`
+  - mean stall `4.4145`
+  - prefetch `354`
+
+### Interpretation
+
+- the adaptive unified controller is now genuinely competitive in the hard
+  regime
+- it still has a generalization problem on the main and middle regimes
+- but it is now much closer to the final one-controller story than before

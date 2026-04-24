@@ -29,6 +29,7 @@ from kv_controller import (
     PageStatsHybridScorer,
     PassthroughHeadWeightedScorer,
     PredictedBoostedHeadActivityScorer,
+    RegimeAwarePageStatsScorer,
     ReuseDistanceHybridScorer,
     apply_scorer_to_trace,
     diagnose_trace_scores,
@@ -59,6 +60,7 @@ def main() -> None:
         "predicted_boosted": PredictedBoostedHeadActivityScorer(),
         "reuse_hybrid": ReuseDistanceHybridScorer(),
         "page_stats_hybrid": PageStatsHybridScorer(),
+        "regime_aware": RegimeAwarePageStatsScorer(),
     }
 
     for scorer_name, scorer in scorers.items():

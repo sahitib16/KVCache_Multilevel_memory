@@ -27,6 +27,7 @@ from kv_controller import (
     build_bandit_action_menu,
     CacheConfig,
     ContextualBanditController,
+    FixedKPrefetchController,
     HeadActivityRecomputedScorer,
     LayerNormalizedHeadActivityScorer,
     LRUController,
@@ -35,12 +36,18 @@ from kv_controller import (
     PageStatsHybridScorer,
     PassthroughHeadWeightedScorer,
     PredictedBoostedHeadActivityScorer,
+    RegimeAwarePageStatsScorer,
     ReuseDistanceHybridScorer,
     ScoreBasedController,
+    SlidingWindowController,
     SimulationConfig,
     SyntheticTraceConfig,
     SyntheticTraceGenerator,
     TransferConfig,
+    TileHotnessController,
+    UnifiedBanditController,
+    UnifiedBlendController,
+    UnifiedRuleController,
     apply_scorer_to_trace,
     benchmark_policies_across_seeds,
     benchmark_policies,
@@ -158,10 +165,22 @@ def build_simulator(args, trace=None) -> OverlapAwareSimulator:
 
 
 def build_controller(policy_name: str, prefetch_k: int, bandit_menu: str = "trimmed"):
+    if policy_name == "fixed_k_prefetch":
+        return FixedKPrefetchController(prefetch_k=prefetch_k)
     if policy_name == "lru":
         return LRUController(prefetch_k=prefetch_k)
     if policy_name == "score":
         return ScoreBasedController(prefetch_k=prefetch_k)
+    if policy_name == "sliding_window":
+        return SlidingWindowController(prefetch_k=prefetch_k)
+    if policy_name == "tile_hotness":
+        return TileHotnessController(prefetch_k=prefetch_k)
+    if policy_name == "unified_rule":
+        return UnifiedRuleController(prefetch_k=prefetch_k)
+    if policy_name == "unified_blend":
+        return UnifiedBlendController(prefetch_k=prefetch_k)
+    if policy_name == "unified_bandit":
+        return UnifiedBanditController()
     if policy_name == "bandit":
         return ContextualBanditController(actions=build_bandit_action_menu(bandit_menu))
     raise ValueError(f"Unknown policy: {policy_name}")
@@ -211,6 +230,7 @@ def main() -> None:
         "predicted_boosted": PredictedBoostedHeadActivityScorer(),
         "reuse_hybrid": ReuseDistanceHybridScorer(),
         "page_stats_hybrid": PageStatsHybridScorer(),
+        "regime_aware": RegimeAwarePageStatsScorer(),
     }
 
     if args.seed_list:

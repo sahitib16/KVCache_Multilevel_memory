@@ -33,6 +33,7 @@ from kv_controller import (
     BeladyOracleController,
     CacheConfig,
     ContextualBanditController,
+    FixedKPrefetchController,
     benchmark_policies,
     benchmark_policies_across_seeds,
     load_trace_json,
@@ -42,10 +43,15 @@ from kv_controller import (
     PolicyOutput,
     ResidencyController,
     ScoreBasedController,
+    SlidingWindowController,
     SimulationConfig,
     SyntheticTraceConfig,
     SyntheticTraceGenerator,
+    TileHotnessController,
     TransferConfig,
+    UnifiedBanditController,
+    UnifiedBlendController,
+    UnifiedRuleController,
     save_trace_json,
     summarize_page_tile_stats,
     write_aggregate_summary_csv,
@@ -119,7 +125,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-k", type=int, default=2)
     parser.add_argument(
         "--policy",
-        choices=["greedy_prefetch", "lru", "score", "belady", "perfect_prefetch", "bandit"],
+        choices=[
+            "greedy_prefetch",
+            "fixed_k_prefetch",
+            "lru",
+            "score",
+            "sliding_window",
+            "tile_hotness",
+            "unified_rule",
+            "unified_blend",
+            "unified_bandit",
+            "belady",
+            "perfect_prefetch",
+            "bandit",
+        ],
         default="greedy_prefetch",
         help="Run a single policy.",
     )
@@ -203,10 +222,22 @@ def build_controller(policy_name: str, args, trace) -> ResidencyController:
 
     if policy_name == "greedy_prefetch":
         return GreedyPrefetchController(prefetch_k=args.prefetch_k)
+    if policy_name == "fixed_k_prefetch":
+        return FixedKPrefetchController(prefetch_k=args.prefetch_k)
     if policy_name == "lru":
         return LRUController(prefetch_k=args.prefetch_k)
     if policy_name == "score":
         return ScoreBasedController(prefetch_k=args.prefetch_k)
+    if policy_name == "sliding_window":
+        return SlidingWindowController(prefetch_k=args.prefetch_k)
+    if policy_name == "tile_hotness":
+        return TileHotnessController(prefetch_k=args.prefetch_k, tile_size_pages=args.tile_size_pages)
+    if policy_name == "unified_rule":
+        return UnifiedRuleController(prefetch_k=args.prefetch_k)
+    if policy_name == "unified_blend":
+        return UnifiedBlendController(prefetch_k=args.prefetch_k)
+    if policy_name == "unified_bandit":
+        return UnifiedBanditController()
     if policy_name == "belady":
         return BeladyOracleController(trace)
     if policy_name == "perfect_prefetch":

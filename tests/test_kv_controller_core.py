@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 import sys
 
@@ -23,17 +24,24 @@ from kv_controller import (
     benchmark_policies_across_seeds,
     benchmark_policies,
     CacheConfig,
+    FixedKPrefetchController,
     LayerAwareScoreController,
     LRUController,
     OverlapAwareSimulator,
     PassthroughHeadWeightedScorer,
     PerfectPrefetchOracleController,
     PolicyOutput,
+    RegimeAwarePageStatsScorer,
     ResidencyController,
     ScoreBasedController,
+    SlidingWindowController,
     SimulationConfig,
     SyntheticTraceConfig,
     SyntheticTraceGenerator,
+    TileHotnessController,
+    UnifiedBanditController,
+    UnifiedBlendController,
+    UnifiedRuleController,
     TransferConfig,
     convert_trace_recent_threshold,
     convert_trace_recent_topk,
@@ -296,6 +304,42 @@ def test_page_stats_hybrid_scorer_uses_causal_hotness_features():
     assert any(score >= 0.0 for score in scores.values())
 
 
+def test_regime_aware_scorer_switches_on_request_reuse_signal():
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+    scorer = RegimeAwarePageStatsScorer(
+        predicted_ratio_threshold=0.0,
+    )
+    scores = scorer.score_step(trace[1])
+    assert scores
+    assert any(score >= 0.0 for score in scores.values())
+
+
+def test_regime_aware_scorer_uses_predicted_footprint_gate():
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+
+    class ConstantScorer:
+        def __init__(self, value: float):
+            self.value = value
+
+        def score_step(self, step):
+            pages = set(step.head_weighted_scores) | set(step.per_page_features)
+            return {page: self.value for page in pages}
+
+    low_pred_step = replace(trace[1], predicted_pages=())
+    high_pred_step = replace(trace[1], predicted_pages=tuple(trace[1].required_pages))
+    scorer = RegimeAwarePageStatsScorer(
+        predicted_ratio_threshold=1.0,
+        normalized_scorer=ConstantScorer(1.0),
+        high_reuse_scorer=ConstantScorer(2.0),
+    )
+
+    low_scores = scorer.score_step(low_pred_step)
+    high_scores = scorer.score_step(high_pred_step)
+
+    assert set(low_scores.values()) == {1.0}
+    assert set(high_scores.values()) == {2.0}
+
+
 def test_page_and_tile_stats_aggregate_pagewise_behavior():
     trace = make_trace(steps=4)
     sim = make_sim(hbm_capacity_pages=8)
@@ -336,6 +380,60 @@ def test_score_based_controller_prefetches_from_predicted_pages():
 
     sim.run(trace, RecordingScoreController(prefetch_k=2))
     assert contexts
+
+
+def test_fixed_k_prefetch_controller_runs():
+    trace = make_trace(steps=2)
+    sim = make_sim(hbm_capacity_pages=10)
+    rows = sim.run(trace, FixedKPrefetchController(prefetch_k=2))
+    assert len(rows) == 2
+
+
+def test_sliding_window_controller_prefers_high_page_id_predictions():
+    trace = make_trace(steps=2)
+    decisions = []
+
+    class RecordingSlidingWindowController(SlidingWindowController):
+        def decide(self, context):
+            decision = super().decide(context)
+            decisions.append(decision)
+            return decision
+
+    sim = make_sim(hbm_capacity_pages=10)
+    sim.run(trace, RecordingSlidingWindowController(prefetch_k=2))
+    for decision in decisions:
+        if decision.prefetch_pages:
+            page_ids = [page.page_id for page in decision.prefetch_pages]
+            assert page_ids == sorted(page_ids, reverse=True)
+
+
+def test_tile_hotness_controller_runs_on_augmented_features():
+    trace = attach_reuse_distance_features(make_trace(steps=2))
+    sim = make_sim(hbm_capacity_pages=10)
+    rows = sim.run(trace, TileHotnessController(prefetch_k=2))
+    assert len(rows) == 2
+
+
+def test_unified_rule_controller_runs():
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+    sim = make_sim(hbm_capacity_pages=10)
+    rows = sim.run(trace, UnifiedRuleController(prefetch_k=2))
+    assert len(rows) == 3
+
+
+def test_unified_blend_controller_runs():
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+    sim = make_sim(hbm_capacity_pages=10)
+    rows = sim.run(trace, UnifiedBlendController(prefetch_k=2))
+    assert len(rows) == 3
+
+
+def test_unified_bandit_controller_runs_and_observes():
+    trace = attach_reuse_distance_features(make_trace(4))
+    sim = make_sim(hbm_capacity_pages=10)
+    controller = UnifiedBanditController()
+    rows = sim.run(trace, controller)
+    assert len(rows) == 4
 
 
 def test_belady_oracle_controller_runs_on_trace():

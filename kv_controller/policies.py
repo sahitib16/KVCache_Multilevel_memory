@@ -35,6 +35,12 @@ import math
 import numpy as np
 
 from .interfaces import ResidencyController
+from .scoring import (
+    HeadActivityRecomputedScorer,
+    LayerNormalizedHeadActivityScorer,
+    NormalizedHeadWeightedScorer,
+    PageStatsHybridScorer,
+)
 from .types import ControllerContext, KVPageId, LayerBudget, PolicyOutput, StepMetrics, WorkloadStep
 
 
@@ -50,6 +56,38 @@ def _score_lookup(context: ControllerContext, page: KVPageId) -> float:
     return context.head_weighted_scores.get(
         page,
         context.per_page_features.get(page, {}).get("head_weighted_score", 0.0),
+    )
+
+
+def _step_from_context(context: ControllerContext) -> WorkloadStep:
+    """Rebuild a step-like object so scorers can be reused online.
+
+    This lets a unified controller consume the same scorer implementations used
+    in offline replay experiments while still making one online decision inside
+    the controller interface.
+    """
+
+    referenced_layers = tuple(
+        sorted(
+            set(page.layer_id for page in context.required_pages)
+            | set(page.layer_id for page in context.predicted_pages)
+            | set(context.layer_budgets)
+        )
+    )
+    return WorkloadStep(
+        step_idx=context.step_idx,
+        required_pages=context.required_pages,
+        predicted_pages=context.predicted_pages,
+        head_weighted_scores=dict(context.head_weighted_scores),
+        query_head_weights=dict(context.query_head_weights),
+        per_page_head_activity=dict(context.per_page_head_activity),
+        per_page_features=dict(context.per_page_features),
+        referenced_layers=referenced_layers,
+        request_id=context.request_id,
+        decode_position=context.decode_position,
+        sequence_length=context.sequence_length,
+        kv_block_size_tokens=context.kv_block_size_tokens,
+        layer_block_tables=dict(context.layer_block_tables),
     )
 
 
@@ -84,6 +122,19 @@ def _incoming_prefetch_pages(
     ]
 
 
+def _incoming_prefetch_pages_by_score(
+    context: ControllerContext,
+    scores: dict[KVPageId, float],
+    prefetch_k: int,
+) -> list[KVPageId]:
+    predicted = sorted(
+        context.predicted_pages,
+        key=lambda page: scores.get(page, _score_lookup(context, page)),
+        reverse=True,
+    )
+    return _incoming_prefetch_pages(context, predicted, prefetch_k)
+
+
 def _guarded_prefetch_k(context: ControllerContext, base_prefetch_k: int) -> int:
     """Throttle prefetch depth when the system already looks pressured.
 
@@ -111,6 +162,17 @@ def _guarded_prefetch_k(context: ControllerContext, base_prefetch_k: int) -> int
     return base_prefetch_k
 
 
+def _mean_feature(context: ControllerContext, name: str) -> float:
+    rows = list(context.per_page_features.values())
+    if not rows:
+        return 0.0
+    return sum(float(features.get(name, 0.0)) for features in rows) / len(rows)
+
+
+def _predicted_ratio(context: ControllerContext) -> float:
+    return len(context.predicted_pages) / max(1, len(context.required_pages))
+
+
 def _lowest_score_resident_pages(context: ControllerContext, count: int) -> tuple[KVPageId, ...]:
     """Pick `count` resident pages with the lowest head-weighted score."""
 
@@ -118,6 +180,53 @@ def _lowest_score_resident_pages(context: ControllerContext, count: int) -> tupl
     candidates = [page for page in context.resident_pages if page not in protected]
     candidates.sort(key=lambda page: _score_lookup(context, page))
     return tuple(candidates[:count])
+
+
+def _lowest_resident_pages_by_scores(
+    context: ControllerContext,
+    scores: dict[KVPageId, float],
+    count: int,
+) -> tuple[KVPageId, ...]:
+    protected = _protected_pages(context)
+    candidates = [page for page in context.resident_pages if page not in protected]
+    candidates.sort(key=lambda page: scores.get(page, _score_lookup(context, page)))
+    return tuple(candidates[:count])
+
+
+def _lowest_page_id_resident_pages(context: ControllerContext, count: int) -> tuple[KVPageId, ...]:
+    """Evict the oldest logical window pages first.
+
+    This is a simple sliding-window approximation: pages with smaller page ids
+    are treated as older / colder than pages with larger page ids.
+    """
+
+    protected = _protected_pages(context)
+    candidates = [page for page in context.resident_pages if page not in protected]
+    candidates.sort(key=lambda page: (page.layer_id, page.page_id))
+    return tuple(candidates[:count])
+
+
+def _highest_page_id_predicted_pages(context: ControllerContext, prefetch_k: int) -> list[KVPageId]:
+    """Prefetch predicted pages that are closest to the moving decode frontier."""
+
+    predicted = sorted(
+        context.predicted_pages,
+        key=lambda page: (page.layer_id, page.page_id),
+        reverse=True,
+    )
+    return _incoming_prefetch_pages(context, predicted, prefetch_k)
+
+
+def _page_tile_id(context: ControllerContext, page: KVPageId, tile_size_pages: int) -> tuple[int, int]:
+    feature_tile_id = context.per_page_features.get(page, {}).get("tile_id")
+    if feature_tile_id is not None:
+        return (page.layer_id, int(feature_tile_id))
+    return (page.layer_id, page.page_id // max(1, tile_size_pages))
+
+
+def _tile_hotness(context: ControllerContext, page: KVPageId, tile_size_pages: int) -> float:
+    features = context.per_page_features.get(page, {})
+    return float(features.get("tile_recent_frequency", 0.0)) + _score_lookup(context, page)
 
 
 def _adaptive_layer_budgets(context: ControllerContext) -> tuple[LayerBudget, ...]:
@@ -230,6 +339,89 @@ class ScoreBasedController(ResidencyController):
         )
 
 
+class FixedKPrefetchController(ResidencyController):
+    """Fixed-k next-window prefetch baseline.
+
+    This is the explicit version of the old lightweight greedy baseline:
+    keep eviction simple and always prefetch the first `k` predicted pages.
+    """
+
+    def __init__(self, prefetch_k: int = 2, guard_prefetch: bool = False):
+        self.prefetch_k = prefetch_k
+        self.guard_prefetch = guard_prefetch
+
+    def decide(self, context: ControllerContext) -> PolicyOutput:
+        effective_prefetch_k = (
+            _guarded_prefetch_k(context, self.prefetch_k) if self.guard_prefetch else self.prefetch_k
+        )
+        predicted = list(context.predicted_pages)
+        incoming_prefetch = _incoming_prefetch_pages(context, predicted, effective_prefetch_k)
+        return PolicyOutput(prefetch_pages=tuple(incoming_prefetch))
+
+
+class SlidingWindowController(ResidencyController):
+    """Simple recency/window baseline.
+
+    Intuition:
+    - pages with larger logical page ids are closer to the decode frontier
+    - keep those hot and evict smaller page ids first
+    """
+
+    def __init__(self, prefetch_k: int = 2, guard_prefetch: bool = False):
+        self.prefetch_k = prefetch_k
+        self.guard_prefetch = guard_prefetch
+
+    def decide(self, context: ControllerContext) -> PolicyOutput:
+        effective_prefetch_k = (
+            _guarded_prefetch_k(context, self.prefetch_k) if self.guard_prefetch else self.prefetch_k
+        )
+        incoming_prefetch = _highest_page_id_predicted_pages(context, effective_prefetch_k)
+        need_slots = max(0, len(incoming_prefetch) - _free_slots(context))
+        evict_pages = _lowest_page_id_resident_pages(context, need_slots)
+        return PolicyOutput(
+            evict_pages=evict_pages,
+            prefetch_pages=tuple(incoming_prefetch),
+        )
+
+
+class TileHotnessController(ResidencyController):
+    """Tile-aware baseline using recent tile hotness plus page score.
+
+    This policy groups pages by tile and prioritizes tiles that look hot under
+    recent access history. It is meant to be a stronger fixed baseline for
+    workloads where neighboring pages tend to stay useful together.
+    """
+
+    def __init__(self, prefetch_k: int = 2, tile_size_pages: int = 4, guard_prefetch: bool = False):
+        self.prefetch_k = prefetch_k
+        self.tile_size_pages = tile_size_pages
+        self.guard_prefetch = guard_prefetch
+
+    def decide(self, context: ControllerContext) -> PolicyOutput:
+        effective_prefetch_k = (
+            _guarded_prefetch_k(context, self.prefetch_k) if self.guard_prefetch else self.prefetch_k
+        )
+        predicted = sorted(
+            context.predicted_pages,
+            key=lambda page: (_tile_hotness(context, page, self.tile_size_pages), _score_lookup(context, page)),
+            reverse=True,
+        )
+        incoming_prefetch = _incoming_prefetch_pages(context, predicted, effective_prefetch_k)
+        need_slots = max(0, len(incoming_prefetch) - _free_slots(context))
+
+        protected = _protected_pages(context)
+        resident_candidates = [page for page in context.resident_pages if page not in protected]
+        resident_candidates.sort(
+            key=lambda page: (_tile_hotness(context, page, self.tile_size_pages), _score_lookup(context, page))
+        )
+        evict_pages = tuple(resident_candidates[:need_slots])
+
+        return PolicyOutput(
+            evict_pages=evict_pages,
+            prefetch_pages=tuple(incoming_prefetch),
+        )
+
+
 class LayerAwareScoreController(ResidencyController):
     """Score-based controller with adaptive per-layer budget updates.
 
@@ -259,6 +451,324 @@ class LayerAwareScoreController(ResidencyController):
             prefetch_pages=tuple(incoming_prefetch),
             layer_budgets=_adaptive_layer_budgets(context),
         )
+
+
+class UnifiedScoreController(ResidencyController):
+    """Base class for a single integrated scorer-driven controller.
+
+    This is the shape we would eventually want in a real engine integration:
+    one controller object that:
+    - extracts page-level features
+    - chooses one scoring view or blend
+    - emits one eviction/prefetch decision
+
+    Subclasses differ only in *how* they choose the effective score map.
+    """
+
+    def __init__(self, prefetch_k: int = 2, guard_prefetch: bool = False):
+        self.prefetch_k = prefetch_k
+        self.guard_prefetch = guard_prefetch
+
+    def effective_scores(self, context: ControllerContext) -> dict[KVPageId, float]:
+        raise NotImplementedError
+
+    def target_prefetch_k(self, context: ControllerContext) -> int:
+        return self.prefetch_k
+
+    def decide(self, context: ControllerContext) -> PolicyOutput:
+        base_prefetch_k = self.target_prefetch_k(context)
+        effective_prefetch_k = (
+            _guarded_prefetch_k(context, base_prefetch_k) if self.guard_prefetch else base_prefetch_k
+        )
+        scores = self.effective_scores(context)
+        incoming_prefetch = _incoming_prefetch_pages_by_score(context, scores, effective_prefetch_k)
+        need_slots = max(0, len(incoming_prefetch) - _free_slots(context))
+        evict_pages = _lowest_resident_pages_by_scores(context, scores, need_slots)
+        return PolicyOutput(
+            evict_pages=evict_pages,
+            prefetch_pages=tuple(incoming_prefetch),
+        )
+
+
+class UnifiedRuleController(UnifiedScoreController):
+    """Single-controller option A: hand-designed regime selector.
+
+    Selection logic:
+    - prefetch-hostile regime: normalized scorer
+    - middle regime with some short reuse: layer-normalized scorer
+    - high predicted-footprint regime: page-stats scorer
+    """
+
+    def __init__(self, prefetch_k: int = 2, guard_prefetch: bool = False):
+        super().__init__(prefetch_k=prefetch_k, guard_prefetch=guard_prefetch)
+        self.normalized = NormalizedHeadWeightedScorer()
+        self.layer_normalized = LayerNormalizedHeadActivityScorer()
+        self.page_stats = PageStatsHybridScorer(beta_reuse=0.12, gamma_page_hotness=0.18, delta_tile_hotness=0.05)
+
+    def target_prefetch_k(self, context: ControllerContext) -> int:
+        predicted_ratio = _predicted_ratio(context)
+        short_reuse_fraction = _mean_feature(context, "request_reuse_distance_short")
+        if predicted_ratio >= 1.0:
+            return max(self.prefetch_k, 4)
+        if short_reuse_fraction >= 0.05:
+            return max(self.prefetch_k, 2)
+        return min(self.prefetch_k, 1)
+
+    def effective_scores(self, context: ControllerContext) -> dict[KVPageId, float]:
+        step = _step_from_context(context)
+        predicted_ratio = _predicted_ratio(context)
+        short_reuse_fraction = _mean_feature(context, "request_reuse_distance_short")
+
+        if predicted_ratio >= 1.0:
+            return self.page_stats.score_step(step)
+        if short_reuse_fraction >= 0.05:
+            return self.layer_normalized.score_step(step)
+        return self.normalized.score_step(step)
+
+
+class UnifiedBlendController(UnifiedScoreController):
+    """Single-controller option B: soft blend over scorer families.
+
+    This avoids hard switching. The blend weights are still interpretable:
+    - normalized: default / hostile regime
+    - layer-normalized: moderate short-reuse regime
+    - page-stats: high predicted-footprint regime
+    """
+
+    def __init__(self, prefetch_k: int = 2, guard_prefetch: bool = False):
+        super().__init__(prefetch_k=prefetch_k, guard_prefetch=guard_prefetch)
+        self.normalized = NormalizedHeadWeightedScorer()
+        self.layer_normalized = LayerNormalizedHeadActivityScorer()
+        self.page_stats = PageStatsHybridScorer(beta_reuse=0.12, gamma_page_hotness=0.18, delta_tile_hotness=0.05)
+
+    def _weights(self, context: ControllerContext) -> tuple[float, float, float]:
+        predicted_ratio = _predicted_ratio(context)
+        short_reuse_fraction = _mean_feature(context, "request_reuse_distance_short")
+
+        page_weight = max(0.0, min(1.0, predicted_ratio - 0.75))
+        layer_weight = max(0.0, min(1.0, short_reuse_fraction / 0.10)) * (1.0 - page_weight)
+        normalized_weight = max(0.0, 1.0 - page_weight - layer_weight)
+        return normalized_weight, layer_weight, page_weight
+
+    def target_prefetch_k(self, context: ControllerContext) -> int:
+        _, layer_weight, page_weight = self._weights(context)
+        if page_weight >= 0.25:
+            return max(self.prefetch_k, 4)
+        if layer_weight >= 0.25:
+            return max(self.prefetch_k, 2)
+        return min(self.prefetch_k, 1)
+
+    def effective_scores(self, context: ControllerContext) -> dict[KVPageId, float]:
+        step = _step_from_context(context)
+        normalized_scores = self.normalized.score_step(step)
+        layer_scores = self.layer_normalized.score_step(step)
+        page_scores = self.page_stats.score_step(step)
+
+        normalized_weight, layer_weight, page_weight = self._weights(context)
+
+        pages = set(normalized_scores) | set(layer_scores) | set(page_scores)
+        return {
+            page: (
+                normalized_weight * normalized_scores.get(page, 0.0)
+                + layer_weight * layer_scores.get(page, 0.0)
+                + page_weight * page_scores.get(page, 0.0)
+            )
+            for page in pages
+        }
+
+
+@dataclass(frozen=True)
+class UnifiedAction:
+    scorer_mode: str
+    prefetch_k: int
+
+
+class UnifiedBanditController(UnifiedScoreController):
+    """Single-controller option C: one lightweight model chooses the mode.
+
+    This is the closest current approximation to the desired final story:
+    one online controller learns whether it should behave like:
+    - normalized scoring
+    - layer-normalized scoring
+    - page-stats scoring
+
+    It still emits one ordinary eviction/prefetch action to the simulator.
+    """
+
+    def __init__(
+        self,
+        actions: tuple[UnifiedAction, ...] | None = None,
+        alpha: float = 0.30,
+        prefetch_penalty: float = 0.001,
+        eviction_penalty: float = 0.001,
+        miss_penalty: float = 0.10,
+        useful_prefetch_bonus: float = 0.04,
+        wasted_prefetch_penalty: float = 0.015,
+        miss_reduction_bonus: float = 0.02,
+        miss_increase_penalty: float = 0.02,
+        bootstrap_steps: int = 2,
+        heuristic_prior_bonus: float = 0.15,
+    ):
+        super().__init__(prefetch_k=2, guard_prefetch=False)
+        self.actions = actions or (
+            UnifiedAction("normalized", 1),
+            UnifiedAction("normalized", 2),
+            UnifiedAction("layer_normalized", 1),
+            UnifiedAction("layer_normalized", 2),
+            UnifiedAction("layer_normalized", 4),
+            UnifiedAction("page_stats", 2),
+            UnifiedAction("page_stats", 4),
+            UnifiedAction("page_stats", 6),
+        )
+        self.alpha = alpha
+        self.prefetch_penalty = prefetch_penalty
+        self.eviction_penalty = eviction_penalty
+        self.miss_penalty = miss_penalty
+        self.useful_prefetch_bonus = useful_prefetch_bonus
+        self.wasted_prefetch_penalty = wasted_prefetch_penalty
+        self.miss_reduction_bonus = miss_reduction_bonus
+        self.miss_increase_penalty = miss_increase_penalty
+        self.bootstrap_steps = bootstrap_steps
+        self.heuristic_prior_bonus = heuristic_prior_bonus
+        self._dim = 12
+        self._A = {action: np.eye(self._dim, dtype=np.float64) for action in self.actions}
+        self._b = {action: np.zeros(self._dim, dtype=np.float64) for action in self.actions}
+        self.last_action: UnifiedAction | None = None
+        self.last_features: np.ndarray | None = None
+        self.last_ucb_scores: dict[UnifiedAction, float] = {}
+        self.steps_observed = 0
+        self.prev_stall_ms = 0.0
+        self.prev_demand_misses = 0.0
+        self.prev_evictions = 0.0
+        self.pending_action: UnifiedAction | None = None
+        self.pending_features: np.ndarray | None = None
+        self.pending_prefetched_pages: frozenset[KVPageId] = frozenset()
+        self.action_counts: dict[UnifiedAction, int] = {action: 0 for action in self.actions}
+        self.normalized = NormalizedHeadWeightedScorer()
+        self.layer_normalized = LayerNormalizedHeadActivityScorer()
+        self.page_stats = PageStatsHybridScorer(beta_reuse=0.12, gamma_page_hotness=0.18, delta_tile_hotness=0.05)
+
+    def _features(self, context: ControllerContext) -> np.ndarray:
+        return np.array(
+            [
+                1.0,
+                _predicted_ratio(context),
+                _mean_feature(context, "request_reuse_distance_short"),
+                _mean_feature(context, "request_reuse_distance_inverse"),
+                context.miss_rate,
+                context.transfer_backlog / max(1, context.hbm_capacity_pages),
+                (len(context.resident_pages) + len(context.inflight_pages)) / max(1, context.hbm_capacity_pages),
+                len(context.required_pages) / max(1, context.hbm_capacity_pages),
+                sum(context.per_layer_pressure.values()) / max(1, len(context.per_layer_pressure)),
+                self.prev_stall_ms,
+                self.prev_demand_misses / 100.0,
+                self.prev_evictions / 100.0,
+            ],
+            dtype=np.float64,
+        )
+
+    def _linucb_score(self, action: UnifiedAction, features: np.ndarray) -> float:
+        A_inv = np.linalg.inv(self._A[action])
+        theta = A_inv @ self._b[action]
+        exploitation = float(theta @ features)
+        exploration = float(self.alpha * math.sqrt(features @ A_inv @ features))
+        return exploitation + exploration
+
+    def _heuristic_action(self, context: ControllerContext) -> UnifiedAction:
+        predicted_ratio = _predicted_ratio(context)
+        short_reuse_fraction = _mean_feature(context, "request_reuse_distance_short")
+        if predicted_ratio >= 1.0:
+            return UnifiedAction("page_stats", 4)
+        if short_reuse_fraction >= 0.05:
+            return UnifiedAction("layer_normalized", 2)
+        return UnifiedAction("normalized", 1)
+
+    def _action_score(self, action: UnifiedAction, features: np.ndarray, heuristic_action: UnifiedAction) -> float:
+        score = self._linucb_score(action, features)
+        if action.scorer_mode == heuristic_action.scorer_mode:
+            score += self.heuristic_prior_bonus
+        if action.prefetch_k == heuristic_action.prefetch_k:
+            score += 0.5 * self.heuristic_prior_bonus
+        return score
+
+    def _mode_scores(self, mode: str, step: WorkloadStep) -> dict[KVPageId, float]:
+        if mode == "normalized":
+            return self.normalized.score_step(step)
+        if mode == "layer_normalized":
+            return self.layer_normalized.score_step(step)
+        if mode == "page_stats":
+            return self.page_stats.score_step(step)
+        raise ValueError(f"Unknown unified scorer mode: {mode}")
+
+    def effective_scores(self, context: ControllerContext) -> dict[KVPageId, float]:
+        step = _step_from_context(context)
+        features = self._features(context)
+        heuristic_action = self._heuristic_action(context)
+
+        if self.steps_observed < self.bootstrap_steps:
+            chosen = heuristic_action
+            self.last_ucb_scores = {chosen: 0.0}
+        else:
+            ucb_scores = {
+                action: self._action_score(action, features, heuristic_action)
+                for action in self.actions
+            }
+            chosen = max(self.actions, key=lambda action: ucb_scores[action])
+            self.last_ucb_scores = ucb_scores
+
+        self.last_action = chosen
+        self.last_features = features
+        self.action_counts[chosen] += 1
+        self.prefetch_k = chosen.prefetch_k
+        return self._mode_scores(chosen.scorer_mode, step)
+
+    def observe(self, context: ControllerContext, decision: PolicyOutput, metrics: StepMetrics) -> None:
+        if self.last_action is None or self.last_features is None:
+            return
+
+        delayed_reward = -(metrics.stall_ms + self.miss_penalty * metrics.demand_misses)
+        immediate_control_cost = -(
+            self.prefetch_penalty * metrics.prefetch_submitted
+            + self.eviction_penalty * metrics.evictions
+        )
+
+        useful_prefetches = len(self.pending_prefetched_pages & set(context.required_pages))
+        wasted_prefetches = len(self.pending_prefetched_pages - set(context.required_pages))
+        miss_reduction = max(0.0, self.prev_demand_misses - float(metrics.demand_misses))
+        miss_increase = max(0.0, float(metrics.demand_misses) - self.prev_demand_misses)
+        delayed_reward += (
+            self.useful_prefetch_bonus * useful_prefetches
+            - self.wasted_prefetch_penalty * wasted_prefetches
+            + self.miss_reduction_bonus * miss_reduction
+            - self.miss_increase_penalty * miss_increase
+        )
+
+        if self.pending_action is not None and self.pending_features is not None:
+            self._A[self.pending_action] = self._A[self.pending_action] + np.outer(
+                self.pending_features, self.pending_features
+            )
+            self._b[self.pending_action] = self._b[self.pending_action] + delayed_reward * self.pending_features
+        else:
+            self._A[self.last_action] = self._A[self.last_action] + np.outer(self.last_features, self.last_features)
+            self._b[self.last_action] = self._b[self.last_action] + delayed_reward * self.last_features
+
+        self._A[self.last_action] = self._A[self.last_action] + np.outer(self.last_features, self.last_features)
+        self._b[self.last_action] = self._b[self.last_action] + immediate_control_cost * self.last_features
+
+        self.pending_action = self.last_action
+        self.pending_features = self.last_features
+        self.pending_prefetched_pages = frozenset(decision.prefetch_pages)
+        self.steps_observed += 1
+        self.prev_stall_ms = metrics.stall_ms
+        self.prev_demand_misses = float(metrics.demand_misses)
+        self.prev_evictions = float(metrics.evictions)
+
+    def diagnostics(self) -> dict[str, object]:
+        return {
+            "steps_observed": self.steps_observed,
+            "last_action": self.last_action,
+            "action_counts": dict(self.action_counts),
+        }
 
 
 class FutureTraceOracle:

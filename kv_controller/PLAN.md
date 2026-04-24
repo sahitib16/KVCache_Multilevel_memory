@@ -18,6 +18,8 @@ The intended novel contribution is:
   - score-based policies
   - adaptive prefetch and budget policies
   - future extensions like head-aware and reuse-aware hybrids
+  - a **single unified controller** that can adapt its scoring behavior across
+    page-pressure regimes inside one online decision interface
 
 The key publishable systems question is:
 - given only page-level state and page-level predictive signals, which
@@ -28,6 +30,17 @@ The simulator should therefore be judged first by:
 - correctness of page-wise behavior
 - quality of page-wise and tile-wise statistics
 - usefulness for comparing controller strategies
+
+Current benchmark framing:
+- main benchmark:
+  `recent_threshold_round_robin_interleave`
+  - strongly prefetch-hostile
+- middle benchmark:
+  `recent_topk_round_robin_interleave`
+  - moderate pressure with some short reuse
+- hard stress benchmark:
+  `round_robin_interleave`
+  - dense, high-pressure multi-request competition
 
 Timing is still allowed as a secondary derived signal, but it is **not** the
 primary validation target until the page-level behavior is clearly correct.
@@ -77,8 +90,11 @@ Not implemented yet:
 - vLLM trace replay / shadow mode / gated live integration
 - broader real-trace collection across more prompts/models and replay-driven verification
 - replay-trace bandit retuning on the new main real benchmark
-- reuse-distance aware scoring / eviction signals
-- expanded fixed-policy family beyond LRU
+- stronger regime-aware scorer switching logic that preserves the main-benchmark
+  gains of `normalized` while still matching the hard-benchmark gains of
+  `page_stats_hybrid`
+- final winner selection among unified-controller designs
+- improve adaptive unified-controller generalization on main and middle regimes
 
 ## Implementation Changes
 1. Consolidate the simulator into a reusable core package.
@@ -127,11 +143,18 @@ Status:
 - Use one fixed-trace runner so all policies see identical workloads.
 
 Status:
-- Partially done. The new harness now has baseline controllers including LRU and score-based behavior.
+- Partially done. The new harness now has baseline controllers including:
+  - LRU
+  - score-based
+  - fixed-k prefetch
+  - sliding-window
+  - tile-hotness
 - The old script baselines still exist and remain useful as historical reference points.
 - HBM-only lower-bound parity and QUEST-style replay should still be unified into the new runner later.
 - Next extension:
-  - add more fixed policies explicitly rather than treating LRU as the only main static baseline
+  - compare the richer fixed-policy family more systematically across:
+    - easy / harsh / middle-ground replay regimes
+    - page/tile realism-gated workloads
   - compare them on:
     - sequential / sliding-window traces
     - irregular sparse traces
@@ -165,11 +188,32 @@ Status:
 
 Status:
 - Partially done. Head-weighted scoring is now required, not optional.
-- A pluggable scorer layer exists, with passthrough and normalized head-weighted scorers.
+- A pluggable scorer layer exists, with:
+  - passthrough
+  - normalized
+  - layer-normalized
+  - predicted-boosted
+  - reuse hybrid
+  - page-stats hybrid
+  - regime-aware page-stats scorer
 - QUEST/min-max/repo-eval integration into the new scorer layer is still pending.
 - Next extension:
-  - add reuse-distance-aware scoring and eviction diagnostics
-  - compare pure head score vs head+reuse hybrid score on the new main replay benchmark
+  - strengthen regime-aware scoring so it actually keeps the `normalized`
+    advantage on the main benchmark while preserving the `page_stats_hybrid`
+    win on the hard benchmark
+  - make the regime selector itself a first-class contribution:
+    - document which signals were tried
+    - record which ones failed
+    - justify the final selector with realism-gated evidence
+  - evaluate selector behavior against the full three-regime suite:
+    - hostile main
+    - middle ground
+    - hard stress
+- compare pure head score vs head+reuse/page-stats hybrid score on realism-gated benchmarks
+  - compare unified-controller options:
+    - rule-based regime selector
+    - blended scorer controller
+    - lightweight bandit selector
 
 7. Add layer-aware budgets in the simulator.
 - Extend page identity to `(layer_id, page_id)` rather than a single flat page index.
@@ -219,6 +263,10 @@ Status:
 - The current action set covers:
   - eviction rule `{LRU, score-based}`
   - prefetch depth `{0, 2, 4}`
+- The broader fixed-policy family now exists separately and includes:
+  - fixed-k prefetch
+  - sliding-window
+  - tile-hotness
 - Future expansion can add layer budgeting and compression toggles once those behaviors are implemented.
 - Next extension:
   - retune the bandit on `recent_threshold_round_robin_interleave` as the main replay benchmark
@@ -236,6 +284,14 @@ Implementation note for Step 4:
 Current note:
 - The first version now updates from per-step reward using a LinUCB-style model.
 - It is intentionally lightweight and inspectable, not a heavy RL agent.
+- A new single-controller track is now in progress:
+  - `UnifiedRuleController`
+  - `UnifiedBlendController`
+  - `UnifiedBanditController`
+- The adaptive unified-bandit path is now partially rehabilitated:
+  - it performs well in the hard regime after delayed-credit and richer
+    features
+  - it still needs work on hostile and middle regimes
 
 9. Treat CPU-tier compression as optional and isolated.
 - Add it only after the non-compressed controller is working.
@@ -265,6 +321,9 @@ Status:
     layer-wise, or tile-wise statistics
 - These outputs should become the default evidence source for simulator
   validation, with time fields treated as supporting context.
+- Realism-gate support is now partially done:
+  - `validate_replay_realism.py` reports page/tile structure and pressure
+  - this should be used before trusting any new benchmark result
 - A more polished benchmark harness is still pending, but the current driver is already sufficient for repeatable policy comparisons.
 - New benchmarking direction:
   - collect a broader real-trace set

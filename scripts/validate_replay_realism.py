@@ -31,6 +31,7 @@ from kv_controller import (
     PageStatsHybridScorer,
     PassthroughHeadWeightedScorer,
     PredictedBoostedHeadActivityScorer,
+    RegimeAwarePageStatsScorer,
     ReuseDistanceHybridScorer,
     ScoreBasedController,
     SimulationConfig,
@@ -118,6 +119,7 @@ def main() -> None:
         "predicted_boosted": PredictedBoostedHeadActivityScorer(),
         "reuse_hybrid": ReuseDistanceHybridScorer(),
         "page_stats_hybrid": PageStatsHybridScorer(),
+        "regime_aware": RegimeAwarePageStatsScorer(),
     }
 
     scorer_names = [name.strip() for name in args.scorers.split(",") if name.strip()]

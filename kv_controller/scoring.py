@@ -223,6 +223,55 @@ class PageStatsHybridScorer(HeadWeightedScorer):
         return hybrid
 
 
+class RegimeAwarePageStatsScorer(HeadWeightedScorer):
+    """Choose between normalized and page-stats hybrid using causal regime cues.
+
+    Current design:
+    - use the simpler normalized scorer in prefetch-hostile regimes
+    - switch to a tuned page-history scorer only when the step shows a large
+      predicted-page footprint
+
+    Why predicted footprint is the main trigger:
+    - on our current benchmark suite, request-local reuse exists in both the
+      main and hard traces
+    - what separates them more cleanly is whether the workload offers a large
+      predicted set that prefetch can exploit
+    - this makes predicted-page footprint a better causal proxy for
+      "prefetch-friendly regime" than reuse alone
+
+    The high-pressure scorer uses slightly softer page-history weights than the
+    standalone `PageStatsHybridScorer`, because that produced a better
+    main-vs-hard compromise in replay experiments.
+
+    This is intentionally lightweight and interpretable. It is meant to test
+    the claim that different scorers are practical in different regimes.
+    """
+
+    def __init__(
+        self,
+        predicted_ratio_threshold: float = 1.00,
+        normalized_scorer: HeadWeightedScorer | None = None,
+        high_reuse_scorer: HeadWeightedScorer | None = None,
+    ):
+        self.predicted_ratio_threshold = predicted_ratio_threshold
+        self.normalized_scorer = normalized_scorer or NormalizedHeadWeightedScorer()
+        self.high_reuse_scorer = high_reuse_scorer or PageStatsHybridScorer(
+            beta_reuse=0.12,
+            gamma_page_hotness=0.18,
+            delta_tile_hotness=0.05,
+        )
+
+    def score_step(self, step: WorkloadStep) -> dict[KVPageId, float]:
+        if not step.per_page_features:
+            return self.normalized_scorer.score_step(step)
+
+        predicted_ratio = len(step.predicted_pages) / max(1, len(step.required_pages))
+
+        if predicted_ratio >= self.predicted_ratio_threshold:
+            return self.high_reuse_scorer.score_step(step)
+        return self.normalized_scorer.score_step(step)
+
+
 def _normalize_feature(step: WorkloadStep, pages: set[KVPageId], feature_name: str) -> dict[KVPageId, float]:
     raw = {
         page: float(step.per_page_features.get(page, {}).get(feature_name, 0.0))

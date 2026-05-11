@@ -2797,3 +2797,148 @@ Current honest conclusion:
   - benchmark-backed tuning of budget reward terms
   - and deciding whether Thompson should become the main unified-controller
     path
+
+## Phase 1: Regime-Adaptive Bandit Warm-Start and Reward Scaling
+
+### Problem Statement
+
+The UnifiedBanditController in the hard regime (round_robin_interleave, capacity=84)
+dramatically underperformed UnifiedRuleController:
+
+  unified_rule:      total_miss=3072  mean_stall=4.2620  prefetch=372
+  unified_bandit:    total_miss=3336  mean_stall=4.6332  prefetch=108
+  unified_thompson:  total_miss=3310  mean_stall=4.3767  prefetch=134
+
+Root causes:
+- warm-start too short: bootstrap_steps=2, LinUCB exploration bonus dwarfs heuristic
+- wasted-prefetch penalty (0.05) is 2.5x the useful-prefetch bonus (0.02)
+- miss penalty too weak relative to stall_ms in hard regime
+
+### Fix: Regime-Adaptive Scaling in AdaptiveUnifiedControllerBase
+
+Hard-regime detection: prefetch_hit_rate >= 0.50 AND page_miss_rate < 0.98
+In hard regime:
+- bootstrap_steps raised to 6
+- heuristic bonus doubled (0.15 -> 0.30)
+- miss_penalty *= 1 + 0.5 * prefetch_hit_rate (~1.5x)
+- wasted_penalty *= max(0.05, 1 - prefetch_hit_rate) (~near zero)
+- useful_bonus *= 1 + prefetch_hit_rate (~2x)
+
+Both score_profile methods updated to use _effective_heuristic_bonus.
+
+Tuning iterations tried and reverted:
+- uniform virtual pre-seeding of LinUCB matrices: regressed (Thompson 3157->3175)
+- heuristic bonus=1.0 bootstrap=8: regressed (bandit 3197)
+- heuristic bonus=0.50 bootstrap=6: regressed (bandit 3193)
+- settled: 2x default (0.30) with bootstrap=6
+
+### Final Results (hard regime)
+
+  unified_rule:      3072 miss  4.2620 stall  372 prefetch
+  unified_bandit:    3181 miss  4.4114 stall  263 prefetch  (-155 misses vs before)
+  unified_thompson:  3157 miss  4.3523 stall  287 prefetch  (-153 misses vs before)
+  score baseline:    3258 miss  4.5285 stall  0   prefetch
+
+Both now beat score baseline. Gap to unified_rule remains (~109-185 misses).
+Main and middle: unchanged or improved.
+
+New script: scripts/tune_unified_bandit_hard.py sweeps 100 param combos on hard benchmark.
+Realism gate added to compare_unified_controllers.py for per-benchmark regime validation.
+
+## GQA Support and LongBench Adapter
+
+### GQA Support: collect_real_head_traces.py
+
+Added _head_concentration_weights_gqa() and _block_activity_gqa() for GQA models.
+Auto-detected from model.config: num_kv_heads != num_q_heads and divisible.
+Collapses [num_q_heads, seq_len] -> [num_kv_heads, seq_len] by averaging within groups.
+Handles Llama-2-70B (64Q/8KV), Mistral-7B (32Q/8KV), etc. Falls back to MHA for GPT-2.
+
+### LongBench Adapter: collect_dataset_head_traces.py
+
+Added longbench choice to --dataset. New --longbench-subset arg (default: narrativeqa).
+Uses THUDM/LongBench on HuggingFace. Use --split test (only test split exists).
+Truncates inputs to 4096 chars. Uses input field directly as prompt.
+
+Example:
+  python scripts/collect_dataset_head_traces.py \
+    --dataset longbench --longbench-subset narrativeqa --split test \
+    --model gpt2 --count 4 --output-dir results/longbench_traces
+
+## Reuse-Distance Feature Overhaul
+
+### Motivation
+
+Three problems with the previous implementation:
+
+1. Not strictly request-local: scorers fell back to global reuse_distance_inverse which
+   conflates multiple requests in interleaved traces.
+
+2. Continuous inverse compresses useful signal: 1/d makes dist=2 vs 3 look very different
+   but dist=20 vs 30 look nearly identical. Three buckets are more informative:
+   - Short (<=3 steps): almost certainly needed soon
+   - Medium (4-10 steps): uncertain, use head score as tiebreaker
+   - Long (>10 steps): probably cold
+
+3. RegimeAwarePageStatsScorer was blind to reuse signal: switched on predicted_ratio only,
+   ignored short_reuse_fraction which is the direct signal that reuse features are useful.
+
+### Changes
+
+scoring.py — attach_reuse_distance_features:
+- short_threshold: 2.0 -> 3.0
+- new medium_threshold=10.0 parameter
+- new reuse_distance_medium and request_reuse_distance_medium features
+- request_reuse_distance_long now fires on d > 10 (was d > 2)
+
+scoring.py — ReuseDistanceHybridScorer:
+- Old: alpha*head + beta*global_inverse
+- New: alpha*head + beta_short*request_short + beta_medium*request_medium
+  defaults: beta_short=0.25, beta_medium=0.10; beta kept for backward compat
+
+scoring.py — PageStatsHybridScorer:
+- Old: beta_reuse * reuse_inv (fell back to global)
+- New: beta_reuse * (2.0 * request_short + 0.8 * request_medium)
+  short-reuse pages: 2x the coefficient; medium: 0.8x; long: 0
+
+scoring.py — RegimeAwarePageStatsScorer:
+- New short_reuse_fraction_threshold=0.15 parameter
+- score_step now computes short_reuse_fraction causally from request_reuse_distance_short
+- Triggers high_reuse_scorer when predicted_ratio >= threshold OR short_reuse_fraction >= threshold
+
+stats.py:
+- short_reuse_count threshold: <=2.0 -> <=3.0
+- new medium_reuse_count bucket: 3.0 < d <= 10.0
+- long_reuse_count threshold: >2.0 -> >10.0
+- summarize_realism_metrics: adds medium_reuse_fraction output field
+
+policies.py:
+- AdaptiveUnifiedControllerBase._features(): dim 3 changed from
+  request_reuse_distance_inverse (continuous) to request_reuse_distance_medium (binary)
+
+tests: 45 pass (was 44+1 new test for short_reuse_fraction gate)
+
+### Benchmark Results (three-regime, single seed)
+
+MAIN: unified_bandit 2182, unified_thompson 2181 — unchanged
+MIDDLE: unified_bandit 2150, unified_thompson 2150 — unchanged
+
+HARD (capacity=84):
+  unified_rule:      3072 miss  4.3983 stall  372 prefetch  (unchanged)
+  unified_bandit:    3128 miss  4.4226 stall  316 prefetch  (-53 misses vs pre-change 3181)
+  unified_thompson:  3242 miss  4.5576 stall  202 prefetch  (+85 misses vs pre-change 3157)
+
+unified_bandit improved: bucketed PageStatsHybrid gives clearer signal for high-reuse pages
+(short: 0.24 boost vs old ~0.06-0.12 continuous inverse). hard_rule_anchor (0.65 page weight) benefits most.
+
+unified_thompson regressed: binary medium bucket (near-constant 0 in hard regime since most
+pages have short reuse <=3 steps) reduces feature variance at dim 3, disrupting Thompson's
+posterior widths. Single-seed result -- may be noise. Multi-seed confirmation needed.
+
+unified_rule unchanged: in round_robin_interleave all pages have short reuse, so bucketed
+boost is uniform and doesn't change relative eviction ordering.
+
+### Next Confirmed Work
+
+- Multi-seed evaluation to distinguish random noise from systematic thompson regression
+- Consider whether Thompson feature normalization or alpha tuning stabilizes hard-regime behavior

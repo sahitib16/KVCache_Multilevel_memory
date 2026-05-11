@@ -604,6 +604,12 @@ class UnifiedBudgetProfile:
 def build_default_unified_trust_profiles(
     weight_step: float = 0.25,
     min_nonzero_weight: float = 0.10,
+    anchor_profiles: tuple[tuple[str, float, float, float], ...] = (
+        ("hostile_anchor", 0.85, 0.15, 0.00),
+        ("middle_anchor", 0.35, 0.65, 0.00),
+        ("hard_rule_anchor", 0.15, 0.20, 0.65),
+        ("hard_page_anchor", 0.05, 0.15, 0.80),
+    ),
 ) -> tuple[UnifiedTrustProfile, ...]:
     """Generate a compact but less-hardcoded trust-profile menu.
 
@@ -638,13 +644,29 @@ def build_default_unified_trust_profiles(
                     page_weight=page_weight,
                 )
             )
+    for name, normalized_weight, layer_weight, page_weight in anchor_profiles:
+        profiles.append(
+            UnifiedTrustProfile(
+                name=name,
+                normalized_weight=normalized_weight,
+                layer_weight=layer_weight,
+                page_weight=page_weight,
+            )
+        )
     # Remove degenerate all-zero case and keep deterministic order with a bias
     # toward simpler profiles first.
-    profiles = [
-        profile
-        for profile in profiles
-        if profile.normalized_weight + profile.layer_weight + profile.page_weight > 0.0
-    ]
+    deduped: dict[tuple[float, float, float], UnifiedTrustProfile] = {}
+    for profile in profiles:
+        if profile.normalized_weight + profile.layer_weight + profile.page_weight <= 0.0:
+            continue
+        key = (
+            round(profile.normalized_weight, 6),
+            round(profile.layer_weight, 6),
+            round(profile.page_weight, 6),
+        )
+        if key not in deduped or profile.name.endswith("_anchor"):
+            deduped[key] = profile
+    profiles = list(deduped.values())
     profiles.sort(
         key=lambda profile: (
             int(profile.page_weight > 0.0),
@@ -705,6 +727,7 @@ class AdaptiveUnifiedControllerBase(UnifiedScoreController):
         budget_miss_increase_penalty: float = 0.04,
         bootstrap_steps: int = 2,
         heuristic_prior_bonus: float = 0.15,
+        regime_prior_metrics: dict[str, float] | None = None,
     ):
         super().__init__(prefetch_k=2, guard_prefetch=False)
         self.trust_profiles = trust_profiles or build_default_unified_trust_profiles()
@@ -722,11 +745,42 @@ class AdaptiveUnifiedControllerBase(UnifiedScoreController):
         self.budget_miss_increase_penalty = budget_miss_increase_penalty
         self.bootstrap_steps = bootstrap_steps
         self.heuristic_prior_bonus = heuristic_prior_bonus
-        self._dim = 18
+        self.regime_prior_metrics = regime_prior_metrics or {}
+
+        # Regime detection: identify hard (high-reuse, prefetch-effective) regime
+        # from pre-computed realism gate outputs.  When the regime is hard we:
+        #   - extend the heuristic warm-start so the bandit spends more initial
+        #     steps near the hard-regime heuristic (open_4 + page_stats trust)
+        #   - double the heuristic prior bonus so that profile stays sticky for
+        #     longer after the warm-start ends
+        #   - scale down the budget wasted-prefetch penalty because prefetch
+        #     rarely wastes in a regime where prefetch_hit_rate ≈ 1
+        #   - scale up the useful-prefetch bonus and miss penalty to match the
+        #     higher value of each prefetched page
+        _prefetch_hit_prior = float(self.regime_prior_metrics.get("prefetch_hit_rate", 0.0))
+        _page_miss_prior = float(self.regime_prior_metrics.get("page_miss_rate", 1.0))
+        self._regime_is_hard = _prefetch_hit_prior >= 0.50 and _page_miss_prior < 0.98
+        if self._regime_is_hard:
+            self.bootstrap_steps = max(bootstrap_steps, 6)
+            # 2× the default bonus keeps the heuristic competitive during early
+            # post-bootstrap exploration without locking the controller into the
+            # heuristic forever once real data accumulates.
+            self._effective_heuristic_bonus = heuristic_prior_bonus * 2.0
+            self._miss_penalty_eff = miss_penalty * (1.0 + 0.5 * _prefetch_hit_prior)
+            self._budget_wasted_penalty_eff = budget_wasted_prefetch_penalty * max(0.05, 1.0 - _prefetch_hit_prior)
+            self._budget_useful_bonus_eff = budget_useful_prefetch_bonus * (1.0 + _prefetch_hit_prior)
+        else:
+            self._effective_heuristic_bonus = heuristic_prior_bonus
+            self._miss_penalty_eff = miss_penalty
+            self._budget_wasted_penalty_eff = budget_wasted_prefetch_penalty
+            self._budget_useful_bonus_eff = budget_useful_prefetch_bonus
+
+        self._dim = 21
         self._trust_A = {profile: np.eye(self._dim, dtype=np.float64) for profile in self.trust_profiles}
         self._trust_b = {profile: np.zeros(self._dim, dtype=np.float64) for profile in self.trust_profiles}
         self._budget_A = {profile: np.eye(self._dim, dtype=np.float64) for profile in self.budget_profiles}
         self._budget_b = {profile: np.zeros(self._dim, dtype=np.float64) for profile in self.budget_profiles}
+
         self.last_trust_profile: UnifiedTrustProfile | None = None
         self.last_budget_profile: UnifiedBudgetProfile | None = None
         self.last_features: np.ndarray | None = None
@@ -778,7 +832,7 @@ class AdaptiveUnifiedControllerBase(UnifiedScoreController):
                 1.0,
                 _predicted_ratio(context),
                 _mean_feature(context, "request_reuse_distance_short"),
-                _mean_feature(context, "request_reuse_distance_inverse"),
+                _mean_feature(context, "request_reuse_distance_medium"),
                 avg_request_page_hotness,
                 avg_tile_hotness,
                 context.miss_rate,
@@ -793,6 +847,9 @@ class AdaptiveUnifiedControllerBase(UnifiedScoreController):
                 self.prev_evictions / 100.0,
                 context.inflight_transfer_count / max(1, context.hbm_capacity_pages),
                 len(context.queued_transfers) / max(1, context.hbm_capacity_pages),
+                float(self.regime_prior_metrics.get("page_miss_rate", 0.0)),
+                float(self.regime_prior_metrics.get("prefetch_hit_rate", 0.0)),
+                float(self.regime_prior_metrics.get("evictions_per_access", 0.0)),
             ],
             dtype=np.float64,
         )
@@ -806,6 +863,19 @@ class AdaptiveUnifiedControllerBase(UnifiedScoreController):
         occupancy_ratio = (
             (len(context.resident_pages) + len(context.inflight_pages)) / max(1, context.hbm_capacity_pages)
         )
+        prior_page_miss = float(self.regime_prior_metrics.get("page_miss_rate", 0.0))
+        prior_prefetch_hit = float(self.regime_prior_metrics.get("prefetch_hit_rate", 0.0))
+        prior_evictions_per_access = float(self.regime_prior_metrics.get("evictions_per_access", 0.0))
+        if prior_prefetch_hit >= 0.50 and prior_page_miss < 0.98:
+            return (
+                self._nearest_trust_profile(0.15, 0.20, 0.65),
+                self._nearest_budget_profile(4, False),
+            )
+        if prior_page_miss >= 0.99 or prior_prefetch_hit <= 0.05 or prior_evictions_per_access >= 1.0:
+            return (
+                self._nearest_trust_profile(0.85, 0.15, 0.00),
+                self._nearest_budget_profile(0, True),
+            )
         if context.transfer_backlog > 0 or occupancy_ratio >= 0.95:
             return (
                 self._nearest_trust_profile(0.85, 0.15, 0.00),
@@ -905,7 +975,7 @@ class AdaptiveUnifiedControllerBase(UnifiedScoreController):
         if self.last_trust_profile is None or self.last_budget_profile is None or self.last_features is None:
             return
 
-        base_reward = -(metrics.stall_ms + self.miss_penalty * metrics.demand_misses)
+        base_reward = -(metrics.stall_ms + self._miss_penalty_eff * metrics.demand_misses)
         control_cost = -(
             self.prefetch_penalty * metrics.prefetch_submitted
             + self.eviction_penalty * metrics.evictions
@@ -925,8 +995,8 @@ class AdaptiveUnifiedControllerBase(UnifiedScoreController):
         budget_reward = (
             base_reward
             + control_cost
-            + self.budget_useful_prefetch_bonus * useful_prefetches
-            - self.budget_wasted_prefetch_penalty * wasted_prefetches
+            + self._budget_useful_bonus_eff * useful_prefetches
+            - self._budget_wasted_penalty_eff * wasted_prefetches
             + self.budget_miss_reduction_bonus * miss_reduction
             - self.budget_miss_increase_penalty * miss_increase
         )
@@ -997,7 +1067,7 @@ class UnifiedBanditController(AdaptiveUnifiedControllerBase):
         exploration = float(self.alpha * math.sqrt(features @ A_inv @ features))
         score = exploitation + exploration
         if profile.name == heuristic_profile.name:
-            score += self.heuristic_prior_bonus
+            score += self._effective_heuristic_bonus
         return score
 
 
@@ -1026,7 +1096,7 @@ class UnifiedThompsonController(AdaptiveUnifiedControllerBase):
         sampled_theta = self.rng.multivariate_normal(theta_mean, self.sample_scale * A_inv)
         score = float(sampled_theta @ features)
         if profile.name == heuristic_profile.name:
-            score += self.heuristic_prior_bonus
+            score += self._effective_heuristic_bonus
         return score
 
 

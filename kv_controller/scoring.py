@@ -151,19 +151,29 @@ class PredictedBoostedHeadActivityScorer(HeadWeightedScorer):
 
 
 class ReuseDistanceHybridScorer(HeadWeightedScorer):
-    """Combine normalized head score with inverse reuse distance.
+    """Combine normalized head score with request-local reuse-distance buckets.
 
-    This is the first novelty-phase scorer:
+    score = alpha * normalized_head_score
+           + beta_short * request_reuse_short
+           + beta_medium * request_reuse_medium
 
-        score = alpha * normalized_head_score + beta * inverse_reuse_distance
+    Short reuse (≤ short_threshold steps): page was needed very recently → strong boost.
+    Medium reuse (short_threshold < d ≤ medium_threshold): uncertain → modest tiebreaker.
+    Long reuse or first-seen: no boost.
 
-    where `inverse_reuse_distance` is expected to be attached to
-    `per_page_features` by `attach_reuse_distance_features(...)`.
+    This replaces the old continuous 1/d formula which compressed the useful signal:
+    distance 2 vs 3 looked very different but 20 vs 30 looked nearly identical.
     """
 
-    def __init__(self, alpha: float = 1.0, beta: float = 0.25):
+    def __init__(self, alpha: float = 1.0, beta_short: float = 0.25, beta_medium: float = 0.10, beta: float | None = None):
         self.alpha = alpha
-        self.beta = beta
+        if beta is not None:
+            # backward compat: beta scales both bucket weights
+            self.beta_short = beta * 2.0
+            self.beta_medium = beta * 0.8
+        else:
+            self.beta_short = beta_short
+            self.beta_medium = beta_medium
 
     def score_step(self, step: WorkloadStep) -> dict[KVPageId, float]:
         head_scores = _normalize_scores(dict(step.head_weighted_scores))
@@ -171,8 +181,10 @@ class ReuseDistanceHybridScorer(HeadWeightedScorer):
         hybrid: dict[KVPageId, float] = {}
         for page in pages:
             head_score = head_scores.get(page, 0.0)
-            reuse_inv = float(step.per_page_features.get(page, {}).get("reuse_distance_inverse", 0.0))
-            hybrid[page] = self.alpha * head_score + self.beta * reuse_inv
+            features = step.per_page_features.get(page, {})
+            short = float(features.get("request_reuse_distance_short", 0.0))
+            medium = float(features.get("request_reuse_distance_medium", 0.0))
+            hybrid[page] = self.alpha * head_score + self.beta_short * short + self.beta_medium * medium
         return hybrid
 
 
@@ -182,7 +194,7 @@ class PageStatsHybridScorer(HeadWeightedScorer):
     This is a stronger reuse-aware scorer than `ReuseDistanceHybridScorer`.
     Instead of only asking "when was this exact page last accessed globally?",
     it uses:
-    - request-aware inverse reuse distance
+    - request-local reuse-distance buckets (short and medium)
     - recent per-page frequency
     - recent per-request page frequency
     - recent tile hotness
@@ -213,10 +225,11 @@ class PageStatsHybridScorer(HeadWeightedScorer):
         hybrid: dict[KVPageId, float] = {}
         for page in pages:
             features = step.per_page_features.get(page, {})
-            reuse_inv = float(features.get("request_reuse_distance_inverse", features.get("reuse_distance_inverse", 0.0)))
+            short = float(features.get("request_reuse_distance_short", 0.0))
+            medium = float(features.get("request_reuse_distance_medium", 0.0))
             hybrid[page] = (
                 self.alpha * head_scores.get(page, 0.0)
-                + self.beta_reuse * reuse_inv
+                + self.beta_reuse * (2.0 * short + 0.8 * medium)
                 + self.gamma_page_hotness * max(page_hotness.get(page, 0.0), request_hotness.get(page, 0.0))
                 + self.delta_tile_hotness * tile_hotness.get(page, 0.0)
             )
@@ -226,18 +239,12 @@ class PageStatsHybridScorer(HeadWeightedScorer):
 class RegimeAwarePageStatsScorer(HeadWeightedScorer):
     """Choose between normalized and page-stats hybrid using causal regime cues.
 
-    Current design:
-    - use the simpler normalized scorer in prefetch-hostile regimes
-    - switch to a tuned page-history scorer only when the step shows a large
-      predicted-page footprint
-
-    Why predicted footprint is the main trigger:
-    - on our current benchmark suite, request-local reuse exists in both the
-      main and hard traces
-    - what separates them more cleanly is whether the workload offers a large
-      predicted set that prefetch can exploit
-    - this makes predicted-page footprint a better causal proxy for
-      "prefetch-friendly regime" than reuse alone
+    Switches based on BOTH predicted page footprint AND observed short-reuse fraction:
+    - short_reuse_fraction is computed step-by-step from request_reuse_distance_short
+      in per_page_features, averaged over required_pages
+    - When either trigger fires (predicted_ratio >= threshold OR short_reuse_fraction
+      >= threshold), the high_reuse_scorer is used
+    - When both are low (hostile/streaming regime), the normalized_scorer is used
 
     The high-pressure scorer uses slightly softer page-history weights than the
     standalone `PageStatsHybridScorer`, because that produced a better
@@ -250,10 +257,12 @@ class RegimeAwarePageStatsScorer(HeadWeightedScorer):
     def __init__(
         self,
         predicted_ratio_threshold: float = 1.00,
+        short_reuse_fraction_threshold: float = 0.15,
         normalized_scorer: HeadWeightedScorer | None = None,
         high_reuse_scorer: HeadWeightedScorer | None = None,
     ):
         self.predicted_ratio_threshold = predicted_ratio_threshold
+        self.short_reuse_fraction_threshold = short_reuse_fraction_threshold
         self.normalized_scorer = normalized_scorer or NormalizedHeadWeightedScorer()
         self.high_reuse_scorer = high_reuse_scorer or PageStatsHybridScorer(
             beta_reuse=0.12,
@@ -266,8 +275,15 @@ class RegimeAwarePageStatsScorer(HeadWeightedScorer):
             return self.normalized_scorer.score_step(step)
 
         predicted_ratio = len(step.predicted_pages) / max(1, len(step.required_pages))
+        short_reuse_fraction = (
+            sum(
+                float(step.per_page_features.get(page, {}).get("request_reuse_distance_short", 0.0))
+                for page in step.required_pages
+            )
+            / max(1, len(step.required_pages))
+        )
 
-        if predicted_ratio >= self.predicted_ratio_threshold:
+        if predicted_ratio >= self.predicted_ratio_threshold or short_reuse_fraction >= self.short_reuse_fraction_threshold:
             return self.high_reuse_scorer.score_step(step)
         return self.normalized_scorer.score_step(step)
 
@@ -283,7 +299,8 @@ def _normalize_feature(step: WorkloadStep, pages: set[KVPageId], feature_name: s
 def attach_reuse_distance_features(
     trace: list[WorkloadStep],
     *,
-    short_threshold: float = 2.0,
+    short_threshold: float = 3.0,
+    medium_threshold: float = 10.0,
     ema_decay: float = 0.5,
     recent_window: int = 16,
     tile_size_pages: int = 4,
@@ -292,6 +309,11 @@ def attach_reuse_distance_features(
 
     These features are computed causally from past accesses only, which keeps
     them usable by a practical controller during replay experiments.
+
+    Reuse distance is classified into three buckets:
+    - short: distance <= short_threshold (recently accessed, strong signal)
+    - medium: short_threshold < distance <= medium_threshold (uncertain)
+    - long: distance > medium_threshold (or first-seen, no boost)
     """
 
     last_access_step: dict[KVPageId, int] = {}
@@ -315,13 +337,15 @@ def attach_reuse_distance_features(
                 reuse_distance = float("inf")
                 reuse_inverse = 0.0
                 reuse_short = 0.0
+                reuse_medium = 0.0
                 reuse_long = 0.0
                 reuse_avg = reuse_ema.get(page, 0.0)
             else:
                 reuse_distance = float(step.step_idx - last_seen)
                 reuse_inverse = 1.0 / max(1.0, reuse_distance)
                 reuse_short = 1.0 if reuse_distance <= short_threshold else 0.0
-                reuse_long = 1.0 if reuse_distance > short_threshold else 0.0
+                reuse_medium = 1.0 if short_threshold < reuse_distance <= medium_threshold else 0.0
+                reuse_long = 1.0 if reuse_distance > medium_threshold else 0.0
                 previous_avg = reuse_ema.get(page, reuse_distance)
                 reuse_avg = ema_decay * reuse_distance + (1.0 - ema_decay) * previous_avg
                 reuse_ema[page] = reuse_avg
@@ -332,12 +356,14 @@ def attach_reuse_distance_features(
                 request_reuse_distance = float("inf")
                 request_reuse_inverse = 0.0
                 request_reuse_short = 0.0
+                request_reuse_medium = 0.0
                 request_reuse_long = 0.0
             else:
                 request_reuse_distance = float(step.decode_position - request_last_seen)
                 request_reuse_inverse = 1.0 / max(1.0, request_reuse_distance)
                 request_reuse_short = 1.0 if request_reuse_distance <= short_threshold else 0.0
-                request_reuse_long = 1.0 if request_reuse_distance > short_threshold else 0.0
+                request_reuse_medium = 1.0 if short_threshold < request_reuse_distance <= medium_threshold else 0.0
+                request_reuse_long = 1.0 if request_reuse_distance > medium_threshold else 0.0
 
             tile_id = page.page_id // max(1, tile_size_pages)
             tile_key = (page.layer_id, tile_id)
@@ -350,6 +376,7 @@ def attach_reuse_distance_features(
             page_features["reuse_distance"] = reuse_distance if reuse_distance != float("inf") else -1.0
             page_features["reuse_distance_inverse"] = reuse_inverse
             page_features["reuse_distance_short"] = reuse_short
+            page_features["reuse_distance_medium"] = reuse_medium
             page_features["reuse_distance_long"] = reuse_long
             page_features["reuse_distance_mavg"] = reuse_avg
             page_features["request_reuse_distance"] = (
@@ -357,6 +384,7 @@ def attach_reuse_distance_features(
             )
             page_features["request_reuse_distance_inverse"] = request_reuse_inverse
             page_features["request_reuse_distance_short"] = request_reuse_short
+            page_features["request_reuse_distance_medium"] = request_reuse_medium
             page_features["request_reuse_distance_long"] = request_reuse_long
             page_features["page_recent_frequency"] = float(page_recent_frequency)
             page_features["request_page_recent_frequency"] = float(request_page_recent_frequency)

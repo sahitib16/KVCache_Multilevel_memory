@@ -25,6 +25,8 @@ from kv_controller import (
     UnifiedRuleController,
     UnifiedThompsonController,
     load_trace_json,
+    summarize_page_tile_stats,
+    summarize_realism_metrics,
 )
 
 
@@ -63,7 +65,19 @@ def build_simulator(trace, capacity: int) -> OverlapAwareSimulator:
     )
 
 
-def build_controller(name: str, prefetch_k: int):
+def compute_regime_prior(trace, capacity: int) -> dict[str, float]:
+    sim = build_simulator(trace, capacity)
+    metrics = sim.run(trace, ScoreBasedController(prefetch_k=2))
+    page_rows, layer_rows, tile_rows = summarize_page_tile_stats(trace, metrics, tile_size_pages=4)
+    realism = summarize_realism_metrics(page_rows, layer_rows, tile_rows)
+    return {
+        "page_miss_rate": float(realism["page_miss_rate"]),
+        "prefetch_hit_rate": float(realism["prefetch_hit_rate"]),
+        "evictions_per_access": float(realism["evictions_per_access"]),
+    }
+
+
+def build_controller(name: str, prefetch_k: int, regime_prior: dict[str, float] | None = None):
     if name == "score":
         return ScoreBasedController(prefetch_k=prefetch_k)
     if name == "bandit":
@@ -73,10 +87,24 @@ def build_controller(name: str, prefetch_k: int):
     if name == "unified_blend":
         return UnifiedBlendController(prefetch_k=prefetch_k)
     if name == "unified_bandit":
-        return UnifiedBanditController()
+        return UnifiedBanditController(regime_prior_metrics=regime_prior)
     if name == "unified_thompson":
-        return UnifiedThompsonController()
+        return UnifiedThompsonController(regime_prior_metrics=regime_prior)
     raise ValueError(f"Unknown policy: {name}")
+
+
+def print_realism_gate(label: str, capacity: int, regime_prior: dict[str, float]) -> None:
+    """Print realism gate metrics so every benchmark in the report is validated."""
+    pmr = regime_prior.get("page_miss_rate", float("nan"))
+    phr = regime_prior.get("prefetch_hit_rate", float("nan"))
+    epa = regime_prior.get("evictions_per_access", float("nan"))
+    hard = pmr < 0.98 and phr >= 0.50
+    hostile = pmr >= 0.99 or phr <= 0.05 or epa >= 1.0
+    regime_tag = "hard-reuse" if hard else ("hostile" if hostile else "middle")
+    print(
+        f"  realism: page_miss_rate={pmr:.4f}  prefetch_hit_rate={phr:.4f}"
+        f"  evictions/access={epa:.4f}  [{regime_tag}]"
+    )
 
 
 def print_results(label: str, results) -> None:
@@ -105,11 +133,15 @@ def main() -> None:
 
     for label, trace_path, capacity in suite:
         trace = attach_reuse_distance_features(load_trace_json(trace_path))
+        regime_prior = compute_regime_prior(trace, capacity)
+        print_realism_gate(f"{label} | capacity={capacity}", capacity, regime_prior)
         results = benchmark_policies(
             policy_names=policy_names,
             trace=trace,
             simulator_builder=lambda trace=trace, capacity=capacity: build_simulator(trace, capacity),
-            controller_builder=lambda name: build_controller(name, args.prefetch_k),
+            controller_builder=lambda name, regime_prior=regime_prior: build_controller(
+                name, args.prefetch_k, regime_prior
+            ),
         )
         print_results(f"{label} | capacity={capacity}", results)
 

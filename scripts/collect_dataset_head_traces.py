@@ -10,6 +10,7 @@ Why this script exists:
 Current dataset adapters:
 - `HuggingFaceH4/mt_bench_prompts`
 - `OpenAssistant/oasst1`
+- `THUDM/LongBench` (long-context QA; use --split test, --longbench-subset to pick task)
 """
 
 from __future__ import annotations
@@ -35,9 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         type=str,
         required=True,
-        choices=["mt_bench", "oasst1"],
+        choices=["mt_bench", "oasst1", "longbench"],
     )
     parser.add_argument("--split", type=str, default="train")
+    parser.add_argument(
+        "--longbench-subset",
+        type=str,
+        default="narrativeqa",
+        help="LongBench task name (e.g. narrativeqa, qasper, gov_report). Only used when --dataset=longbench.",
+    )
     parser.add_argument("--count", type=int, default=8)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--model", type=str, default="gpt2")
@@ -48,13 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_dataset_rows(dataset_name: str, split: str):
+def _load_dataset_rows(dataset_name: str, split: str, longbench_subset: str = "narrativeqa"):
     from datasets import load_dataset
 
     if dataset_name == "mt_bench":
         return load_dataset("HuggingFaceH4/mt_bench_prompts", split=split)
     if dataset_name == "oasst1":
         return load_dataset("OpenAssistant/oasst1", split=split)
+    if dataset_name == "longbench":
+        return load_dataset("THUDM/LongBench", name=longbench_subset, split=split)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -87,6 +96,17 @@ def _extract_prompts(dataset_name: str, rows, count: int, offset: int) -> list[t
                 prompts.append((f"oasst1_{len(prompts)}", text))
         return prompts[offset:offset + count]
 
+    if dataset_name == "longbench":
+        # LongBench: each row has an `input` field combining context and question.
+        # Contexts can be very long; we cap at 4096 chars so the model doesn't OOM.
+        for i, row in enumerate(rows):
+            if len(prompts) >= count + offset:
+                break
+            text = str(row.get("input", "") or row.get("context", "")).strip()
+            if text:
+                prompts.append((f"longbench_{i}", text[:4096]))
+        return prompts[offset:offset + count]
+
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -94,7 +114,7 @@ def main() -> None:
     args = build_parser().parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    rows = _load_dataset_rows(args.dataset, args.split)
+    rows = _load_dataset_rows(args.dataset, args.split, longbench_subset=args.longbench_subset)
     prompts = _extract_prompts(args.dataset, rows, args.count, args.offset)
 
     if not prompts:

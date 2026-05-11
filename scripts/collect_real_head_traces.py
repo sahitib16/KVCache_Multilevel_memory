@@ -100,6 +100,24 @@ def _head_concentration_weights(last_token_attention, torch) -> tuple[float, ...
     return tuple(float(value / total) for value in concentrations)
 
 
+def _head_concentration_weights_gqa(last_token_attention, num_kv_heads: int, torch) -> tuple[float, ...]:
+    """Concentration weights collapsed to KV-head granularity for GQA models.
+
+    Transformers returns attention of shape [num_q_heads, seq_len] even for GQA.
+    We average across the query heads that share each KV head, then compute
+    concentration on the collapsed [num_kv_heads, seq_len] tensor.
+    """
+    num_q_heads = int(last_token_attention.shape[0])
+    group_size = num_q_heads // num_kv_heads
+    # [num_q_heads, seq_len] → [num_kv_heads, group_size, seq_len] → [num_kv_heads, seq_len]
+    kv_attention = last_token_attention.reshape(num_kv_heads, group_size, -1).mean(dim=1)
+    concentrations = torch.sum(kv_attention * kv_attention, dim=-1)
+    total = torch.sum(concentrations)
+    if float(total) <= 0.0:
+        return tuple(float(1.0 / num_kv_heads) for _ in range(num_kv_heads))
+    return tuple(float(value / total) for value in concentrations)
+
+
 def _block_activity(last_token_attention, block_size_tokens: int, torch) -> dict[int, tuple[float, ...]]:
     """Aggregate last-token attention mass into block/page activity per head."""
 
@@ -115,12 +133,34 @@ def _block_activity(last_token_attention, block_size_tokens: int, torch) -> dict
     return activity
 
 
+def _block_activity_gqa(last_token_attention, block_size_tokens: int, num_kv_heads: int, torch) -> dict[int, tuple[float, ...]]:
+    """Block activity collapsed to KV-head granularity for GQA models."""
+    num_q_heads = int(last_token_attention.shape[0])
+    seq_len = int(last_token_attention.shape[-1])
+    group_size = num_q_heads // num_kv_heads
+    # [num_q_heads, seq_len] → [num_kv_heads, seq_len]
+    kv_attention = last_token_attention.reshape(num_kv_heads, group_size, -1).mean(dim=1)
+    block_ids = _block_table(seq_len, block_size_tokens)
+    activity: dict[int, tuple[float, ...]] = {}
+    for block_id in block_ids:
+        start = block_id * block_size_tokens
+        end = min(seq_len, start + block_size_tokens)
+        block_mass = torch.sum(kv_attention[:, start:end], dim=-1)
+        activity[block_id] = tuple(float(value) for value in block_mass)
+    return activity
+
+
 def collect_trace(args) -> list[WorkloadStep]:
     """Run a small real model and convert decode-time attentions into replay steps."""
 
     model, tokenizer, torch, device = _load_model_and_tokenizer(args.model, args.device)
     tokenized = tokenizer(args.prompt, return_tensors="pt")
     input_ids = tokenized["input_ids"].to(device)
+
+    # Detect GQA: models with fewer KV heads than query heads (e.g. Llama-2-70B, Mistral-7B).
+    num_q_heads = getattr(model.config, 'num_attention_heads', None) or getattr(model.config, 'n_head', 1)
+    num_kv_heads = getattr(model.config, 'num_key_value_heads', num_q_heads)
+    use_gqa = num_kv_heads != num_q_heads and num_q_heads % num_kv_heads == 0
 
     trace: list[WorkloadStep] = []
     with torch.no_grad():
@@ -143,13 +183,17 @@ def collect_trace(args) -> list[WorkloadStep]:
             predicted_blocks = _predicted_block_table(sequence_length, args.kv_block_size_tokens)
 
             for layer_id, layer_attention in enumerate(attentions):
-                # Shape: [batch, heads, query_len, key_len]
+                # Shape: [batch, num_q_heads, query_len, key_len]
                 last_token_attention = layer_attention[0, :, -1, :]
-                layer_weights = _head_concentration_weights(last_token_attention, torch)
+                if use_gqa:
+                    layer_weights = _head_concentration_weights_gqa(last_token_attention, num_kv_heads, torch)
+                    block_activity = _block_activity_gqa(last_token_attention, args.kv_block_size_tokens, num_kv_heads, torch)
+                else:
+                    layer_weights = _head_concentration_weights(last_token_attention, torch)
+                    block_activity = _block_activity(last_token_attention, args.kv_block_size_tokens, torch)
                 query_head_weights[layer_id] = layer_weights
                 layer_block_tables[layer_id] = current_blocks
 
-                block_activity = _block_activity(last_token_attention, args.kv_block_size_tokens, torch)
                 for block_id in current_blocks:
                     page = KVPageId(layer_id=layer_id, page_id=block_id)
                     required_pages.append(page)

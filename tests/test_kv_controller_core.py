@@ -286,6 +286,7 @@ def test_attach_reuse_distance_features_adds_expected_fields():
     assert "reuse_distance_long" in features
     assert "reuse_distance_mavg" in features
     assert "request_reuse_distance_inverse" in features
+    assert "request_reuse_distance_medium" in features
     assert "page_recent_frequency" in features
     assert "request_page_recent_frequency" in features
     assert "tile_recent_frequency" in features
@@ -332,6 +333,7 @@ def test_regime_aware_scorer_uses_predicted_footprint_gate():
     high_pred_step = replace(trace[1], predicted_pages=tuple(trace[1].required_pages))
     scorer = RegimeAwarePageStatsScorer(
         predicted_ratio_threshold=1.0,
+        short_reuse_fraction_threshold=1.1,
         normalized_scorer=ConstantScorer(1.0),
         high_reuse_scorer=ConstantScorer(2.0),
     )
@@ -341,6 +343,43 @@ def test_regime_aware_scorer_uses_predicted_footprint_gate():
 
     assert set(low_scores.values()) == {1.0}
     assert set(high_scores.values()) == {2.0}
+
+
+def test_regime_aware_scorer_uses_short_reuse_fraction_gate():
+    """Short-reuse fraction trigger fires independently of predicted-page ratio."""
+    trace = attach_reuse_distance_features(make_trace(steps=3))
+
+    class ConstantScorer:
+        def __init__(self, value: float):
+            self.value = value
+
+        def score_step(self, step):
+            pages = set(step.head_weighted_scores) | set(step.per_page_features)
+            return {page: self.value for page in pages}
+
+    # Step 1 of the synthetic trace: pages were accessed at step 0 (distance=1 ≤ 3),
+    # so short_reuse_fraction > 0. Disable predicted_ratio trigger so only short_reuse fires.
+    no_pred_step = replace(trace[1], predicted_pages=())
+    scorer_high_thresh = RegimeAwarePageStatsScorer(
+        predicted_ratio_threshold=10.0,
+        short_reuse_fraction_threshold=1.1,
+        normalized_scorer=ConstantScorer(1.0),
+        high_reuse_scorer=ConstantScorer(2.0),
+    )
+    scorer_low_thresh = RegimeAwarePageStatsScorer(
+        predicted_ratio_threshold=10.0,
+        short_reuse_fraction_threshold=0.01,
+        normalized_scorer=ConstantScorer(1.0),
+        high_reuse_scorer=ConstantScorer(2.0),
+    )
+
+    # With high threshold: neither trigger fires → normalized scorer
+    scores_no_trigger = scorer_high_thresh.score_step(no_pred_step)
+    assert set(scores_no_trigger.values()) == {1.0}
+
+    # With low threshold: short_reuse_fraction trigger fires → high_reuse scorer
+    scores_triggered = scorer_low_thresh.score_step(no_pred_step)
+    assert set(scores_triggered.values()) == {2.0}
 
 
 def test_page_and_tile_stats_aggregate_pagewise_behavior():

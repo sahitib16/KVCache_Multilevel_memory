@@ -54,6 +54,8 @@ from kv_controller import (
     benchmark_policies,
     load_trace_json,
     save_trace_json,
+    summarize_page_tile_stats,
+    summarize_realism_metrics,
 )
 
 
@@ -165,7 +167,24 @@ def build_simulator(args, trace=None) -> OverlapAwareSimulator:
     )
 
 
-def build_controller(policy_name: str, prefetch_k: int, bandit_menu: str = "trimmed"):
+def compute_regime_prior(trace, args) -> dict[str, float]:
+    sim = build_simulator(args, trace)
+    metrics = sim.run(trace, ScoreBasedController(prefetch_k=args.prefetch_k))
+    page_rows, layer_rows, tile_rows = summarize_page_tile_stats(trace, metrics, tile_size_pages=4)
+    realism = summarize_realism_metrics(page_rows, layer_rows, tile_rows)
+    return {
+        "page_miss_rate": float(realism["page_miss_rate"]),
+        "prefetch_hit_rate": float(realism["prefetch_hit_rate"]),
+        "evictions_per_access": float(realism["evictions_per_access"]),
+    }
+
+
+def build_controller(
+    policy_name: str,
+    prefetch_k: int,
+    bandit_menu: str = "trimmed",
+    regime_prior: dict[str, float] | None = None,
+):
     if policy_name == "fixed_k_prefetch":
         return FixedKPrefetchController(prefetch_k=prefetch_k)
     if policy_name == "lru":
@@ -181,9 +200,9 @@ def build_controller(policy_name: str, prefetch_k: int, bandit_menu: str = "trim
     if policy_name == "unified_blend":
         return UnifiedBlendController(prefetch_k=prefetch_k)
     if policy_name == "unified_bandit":
-        return UnifiedBanditController()
+        return UnifiedBanditController(regime_prior_metrics=regime_prior)
     if policy_name == "unified_thompson":
-        return UnifiedThompsonController()
+        return UnifiedThompsonController(regime_prior_metrics=regime_prior)
     if policy_name == "bandit":
         return ContextualBanditController(actions=build_bandit_action_menu(bandit_menu))
     raise ValueError(f"Unknown policy: {policy_name}")
@@ -240,6 +259,7 @@ def main() -> None:
         seeds = [int(seed.strip()) for seed in args.seed_list.split(",") if seed.strip()]
         for scorer_name, scorer in scorers.items():
             for bandit_menu in bandit_menus:
+                regime_prior = compute_regime_prior(apply_scorer_to_trace(base_trace, scorer), args)
                 aggregate_results = benchmark_policies_across_seeds(
                     policy_names=policy_names,
                     seeds=seeds,
@@ -254,6 +274,7 @@ def main() -> None:
                         policy_name,
                         args.prefetch_k,
                         bandit_menu=bandit_menu,
+                        regime_prior=regime_prior,
                     ),
                 )
                 print_aggregate_results(
@@ -265,6 +286,7 @@ def main() -> None:
     for scorer_name, scorer in scorers.items():
         for bandit_menu in bandit_menus:
             rescored_trace = apply_scorer_to_trace(base_trace, scorer)
+            regime_prior = compute_regime_prior(rescored_trace, args)
             results = benchmark_policies(
                 policy_names=policy_names,
                 trace=rescored_trace,
@@ -273,6 +295,7 @@ def main() -> None:
                     policy_name,
                     args.prefetch_k,
                     bandit_menu=bandit_menu,
+                    regime_prior=regime_prior,
                 ),
             )
             print_results_for_scorer(f"{scorer_name} | bandit_menu={bandit_menu}", [result.summary for result in results])

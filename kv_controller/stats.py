@@ -115,8 +115,9 @@ def summarize_page_tile_stats(
                 "first_access_step": -1 if row["first_access_step"] is None else row["first_access_step"],
                 "last_access_step": -1 if row["last_access_step"] is None else row["last_access_step"],
                 "mean_reuse_distance": _safe_mean(reuse_distances),
-                "short_reuse_count": sum(1 for value in reuse_distances if value <= 2.0),
-                "long_reuse_count": sum(1 for value in reuse_distances if value > 2.0),
+                "short_reuse_count": sum(1 for value in reuse_distances if value <= 3.0),
+                "medium_reuse_count": sum(1 for value in reuse_distances if 3.0 < value <= 10.0),
+                "long_reuse_count": sum(1 for value in reuse_distances if value > 10.0),
             }
         )
 
@@ -141,6 +142,7 @@ def summarize_page_tile_stats(
             "eviction_count",
             "resident_steps",
             "short_reuse_count",
+            "medium_reuse_count",
             "long_reuse_count",
         ]:
             layer_row[key] += float(row[key])
@@ -172,6 +174,7 @@ def summarize_page_tile_stats(
                     else 0.0
                 ),
                 "short_reuse_count": int(row["short_reuse_count"]),
+                "medium_reuse_count": int(row["medium_reuse_count"]),
                 "long_reuse_count": int(row["long_reuse_count"]),
             }
         )
@@ -197,6 +200,7 @@ def summarize_page_tile_stats(
                     else 0.0
                 ),
                 "short_reuse_count": int(row["short_reuse_count"]),
+                "medium_reuse_count": int(row["medium_reuse_count"]),
                 "long_reuse_count": int(row["long_reuse_count"]),
             }
         )
@@ -256,7 +260,14 @@ def summarize_realism_metrics(
             sum(int(row["short_reuse_count"]) for row in page_rows)
             / max(
                 1,
-                sum(int(row["short_reuse_count"]) + int(row["long_reuse_count"]) for row in page_rows),
+                sum(int(row["short_reuse_count"]) + int(row.get("medium_reuse_count", 0)) + int(row["long_reuse_count"]) for row in page_rows),
+            )
+        ),
+        "medium_reuse_fraction": (
+            sum(int(row.get("medium_reuse_count", 0)) for row in page_rows)
+            / max(
+                1,
+                sum(int(row["short_reuse_count"]) + int(row.get("medium_reuse_count", 0)) + int(row["long_reuse_count"]) for row in page_rows),
             )
         ),
         "hot_page_access_share_top10pct": _top_share(page_rows, "access_count"),

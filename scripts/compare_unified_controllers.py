@@ -23,6 +23,7 @@ from kv_controller import (
     UnifiedBanditController,
     UnifiedBlendController,
     UnifiedRuleController,
+    UnifiedThompsonController,
     load_trace_json,
 )
 
@@ -73,6 +74,8 @@ def build_controller(name: str, prefetch_k: int):
         return UnifiedBlendController(prefetch_k=prefetch_k)
     if name == "unified_bandit":
         return UnifiedBanditController()
+    if name == "unified_thompson":
+        return UnifiedThompsonController()
     raise ValueError(f"Unknown policy: {name}")
 
 
@@ -98,7 +101,7 @@ def main() -> None:
         ("MIDDLE", os.path.join(args.benchmark_dir, "recent_topk_round_robin_interleave.json"), args.middle_capacity),
         ("HARD", os.path.join(args.benchmark_dir, "round_robin_interleave.json"), args.hard_capacity),
     ]
-    policy_names = ["score", "bandit", "unified_rule", "unified_blend", "unified_bandit"]
+    policy_names = ["score", "bandit", "unified_rule", "unified_blend", "unified_bandit", "unified_thompson"]
 
     for label, trace_path, capacity in suite:
         trace = attach_reuse_distance_features(load_trace_json(trace_path))

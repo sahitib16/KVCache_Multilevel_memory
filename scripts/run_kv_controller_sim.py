@@ -52,6 +52,7 @@ from kv_controller import (
     UnifiedBanditController,
     UnifiedBlendController,
     UnifiedRuleController,
+    UnifiedThompsonController,
     save_trace_json,
     summarize_page_tile_stats,
     write_aggregate_summary_csv,
@@ -135,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
             "unified_rule",
             "unified_blend",
             "unified_bandit",
+            "unified_thompson",
             "belady",
             "perfect_prefetch",
             "bandit",
@@ -238,6 +240,8 @@ def build_controller(policy_name: str, args, trace) -> ResidencyController:
         return UnifiedBlendController(prefetch_k=args.prefetch_k)
     if policy_name == "unified_bandit":
         return UnifiedBanditController()
+    if policy_name == "unified_thompson":
+        return UnifiedThompsonController()
     if policy_name == "belady":
         return BeladyOracleController(trace)
     if policy_name == "perfect_prefetch":

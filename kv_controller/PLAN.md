@@ -95,6 +95,9 @@ Not implemented yet:
   `page_stats_hybrid`
 - final winner selection among unified-controller designs
 - improve adaptive unified-controller generalization on main and middle regimes
+- unified-controller comparison across different lightweight model types
+- reduce hardcoded unified-controller menus and move more controller behavior
+  into generated action spaces plus benchmark-backed tuning
 
 ## Implementation Changes
 1. Consolidate the simulator into a reusable core package.
@@ -214,6 +217,15 @@ Status:
     - rule-based regime selector
     - blended scorer controller
     - lightweight bandit selector
+    - lightweight Thompson-style selector
+  - keep the final system target as **one integrated controller**, but compare
+    multiple lightweight online model forms while the simulator is still the
+    experimentation environment
+  - current working hypothesis:
+    - LinUCB is still the strongest high-pressure learner when the budget
+      reward is loose
+    - Thompson-style selection may generalize better once the budget learner is
+      made stricter and the action spaces are generated rather than hand-picked
 
 7. Add layer-aware budgets in the simulator.
 - Extend page identity to `(layer_id, page_id)` rather than a single flat page index.
@@ -292,6 +304,9 @@ Current note:
   - it performs well in the hard regime after delayed-credit and richer
     features
   - it still needs work on hostile and middle regimes
+- A more-adaptive trust-profile version has now been tested:
+  - it removes more hardcoded scorer switching
+  - but currently over-prefetches and does not yet generalize better
 
 9. Treat CPU-tier compression as optional and isolated.
 - Add it only after the non-compressed controller is working.

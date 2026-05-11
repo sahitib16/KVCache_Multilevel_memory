@@ -24,6 +24,8 @@ from kv_controller import (
     benchmark_policies_across_seeds,
     benchmark_policies,
     CacheConfig,
+    build_default_unified_budget_profiles,
+    build_default_unified_trust_profiles,
     FixedKPrefetchController,
     LayerAwareScoreController,
     LRUController,
@@ -42,6 +44,7 @@ from kv_controller import (
     UnifiedBanditController,
     UnifiedBlendController,
     UnifiedRuleController,
+    UnifiedThompsonController,
     TransferConfig,
     convert_trace_recent_threshold,
     convert_trace_recent_topk,
@@ -434,6 +437,25 @@ def test_unified_bandit_controller_runs_and_observes():
     controller = UnifiedBanditController()
     rows = sim.run(trace, controller)
     assert len(rows) == 4
+
+
+def test_unified_thompson_controller_runs_and_observes():
+    trace = attach_reuse_distance_features(make_trace(4))
+    sim = make_sim(hbm_capacity_pages=10)
+    controller = UnifiedThompsonController()
+    rows = sim.run(trace, controller)
+    assert len(rows) == 4
+
+
+def test_generated_unified_profile_menus_cover_conservative_and_aggressive_cases():
+    trust_profiles = build_default_unified_trust_profiles()
+    budget_profiles = build_default_unified_budget_profiles()
+
+    assert any(profile.page_weight > 0.0 for profile in trust_profiles)
+    assert any(profile.layer_weight > 0.0 for profile in trust_profiles)
+    assert any(profile.normalized_weight >= 0.75 for profile in trust_profiles)
+    assert any(profile.prefetch_k == 0 for profile in budget_profiles)
+    assert any(profile.prefetch_k >= 4 and not profile.guard_prefetch for profile in budget_profiles)
 
 
 def test_belady_oracle_controller_runs_on_trace():

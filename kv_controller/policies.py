@@ -579,26 +579,119 @@ class UnifiedBlendController(UnifiedScoreController):
 
 @dataclass(frozen=True)
 class UnifiedAction:
-    scorer_mode: str
+    name: str
+    normalized_weight: float
+    layer_weight: float
+    page_weight: float
     prefetch_k: int
 
 
-class UnifiedBanditController(UnifiedScoreController):
-    """Single-controller option C: one lightweight model chooses the mode.
+@dataclass(frozen=True)
+class UnifiedTrustProfile:
+    name: str
+    normalized_weight: float
+    layer_weight: float
+    page_weight: float
 
-    This is the closest current approximation to the desired final story:
-    one online controller learns whether it should behave like:
-    - normalized scoring
-    - layer-normalized scoring
-    - page-stats scoring
 
-    It still emits one ordinary eviction/prefetch action to the simulator.
+@dataclass(frozen=True)
+class UnifiedBudgetProfile:
+    name: str
+    prefetch_k: int
+    guard_prefetch: bool
+
+
+def build_default_unified_trust_profiles(
+    weight_step: float = 0.25,
+    min_nonzero_weight: float = 0.10,
+) -> tuple[UnifiedTrustProfile, ...]:
+    """Generate a compact but less-hardcoded trust-profile menu.
+
+    Rather than hand-writing a small fixed list, we generate a coarse simplex
+    over normalized/layer/page trust. This keeps the action space
+    interpretable while reducing arbitrary hardcoded choices.
+    """
+
+    scale = int(round(1.0 / weight_step))
+    profiles: list[UnifiedTrustProfile] = []
+    for normalized_units in range(scale + 1):
+        for layer_units in range(scale + 1 - normalized_units):
+            page_units = scale - normalized_units - layer_units
+            normalized_weight = normalized_units / scale
+            layer_weight = layer_units / scale
+            page_weight = page_units / scale
+            if max(normalized_weight, layer_weight, page_weight) < min_nonzero_weight:
+                continue
+            if normalized_weight == 0.0 and layer_weight == 0.0:
+                name = f"page_{page_weight:.2f}"
+            elif page_weight == 0.0 and layer_weight == 0.0:
+                name = f"norm_{normalized_weight:.2f}"
+            elif page_weight == 0.0:
+                name = f"norm_layer_{normalized_weight:.2f}_{layer_weight:.2f}"
+            else:
+                name = f"mix_{normalized_weight:.2f}_{layer_weight:.2f}_{page_weight:.2f}"
+            profiles.append(
+                UnifiedTrustProfile(
+                    name=name,
+                    normalized_weight=normalized_weight,
+                    layer_weight=layer_weight,
+                    page_weight=page_weight,
+                )
+            )
+    # Remove degenerate all-zero case and keep deterministic order with a bias
+    # toward simpler profiles first.
+    profiles = [
+        profile
+        for profile in profiles
+        if profile.normalized_weight + profile.layer_weight + profile.page_weight > 0.0
+    ]
+    profiles.sort(
+        key=lambda profile: (
+            int(profile.page_weight > 0.0),
+            int(profile.layer_weight > 0.0),
+            -profile.normalized_weight,
+            -profile.layer_weight,
+            profile.name,
+        )
+    )
+    return tuple(profiles)
+
+
+def build_default_unified_budget_profiles(
+    prefetch_levels: tuple[int, ...] = (0, 1, 2, 4, 6),
+) -> tuple[UnifiedBudgetProfile, ...]:
+    """Generate budget profiles programmatically.
+
+    We expose both guarded and unguarded variants for nonzero prefetch levels,
+    and always include a true no-prefetch option so the controller can learn
+    explicit conservatism instead of approximating it.
+    """
+
+    profiles = [UnifiedBudgetProfile("no_prefetch", 0, True)]
+    for prefetch_k in prefetch_levels:
+        if prefetch_k <= 0:
+            continue
+        profiles.append(UnifiedBudgetProfile(f"guarded_{prefetch_k}", prefetch_k, True))
+        profiles.append(UnifiedBudgetProfile(f"open_{prefetch_k}", prefetch_k, False))
+    return tuple(profiles)
+
+
+class AdaptiveUnifiedControllerBase(UnifiedScoreController):
+    """Base class for adaptive unified controllers with decoupled decisions.
+
+    The controller chooses two things separately:
+    - which scorer family to trust
+    - how aggressive prefetch should be
+
+    This removes an important source of hardcoding from the previous
+    implementation, where a single action implicitly bundled trust and
+    aggressiveness together.
     """
 
     def __init__(
         self,
-        actions: tuple[UnifiedAction, ...] | None = None,
-        alpha: float = 0.30,
+        trust_profiles: tuple[UnifiedTrustProfile, ...] | None = None,
+        budget_profiles: tuple[UnifiedBudgetProfile, ...] | None = None,
         prefetch_penalty: float = 0.001,
         eviction_penalty: float = 0.001,
         miss_penalty: float = 0.10,
@@ -606,21 +699,16 @@ class UnifiedBanditController(UnifiedScoreController):
         wasted_prefetch_penalty: float = 0.015,
         miss_reduction_bonus: float = 0.02,
         miss_increase_penalty: float = 0.02,
+        budget_useful_prefetch_bonus: float = 0.02,
+        budget_wasted_prefetch_penalty: float = 0.05,
+        budget_miss_reduction_bonus: float = 0.01,
+        budget_miss_increase_penalty: float = 0.04,
         bootstrap_steps: int = 2,
         heuristic_prior_bonus: float = 0.15,
     ):
         super().__init__(prefetch_k=2, guard_prefetch=False)
-        self.actions = actions or (
-            UnifiedAction("normalized", 1),
-            UnifiedAction("normalized", 2),
-            UnifiedAction("layer_normalized", 1),
-            UnifiedAction("layer_normalized", 2),
-            UnifiedAction("layer_normalized", 4),
-            UnifiedAction("page_stats", 2),
-            UnifiedAction("page_stats", 4),
-            UnifiedAction("page_stats", 6),
-        )
-        self.alpha = alpha
+        self.trust_profiles = trust_profiles or build_default_unified_trust_profiles()
+        self.budget_profiles = budget_profiles or build_default_unified_budget_profiles()
         self.prefetch_penalty = prefetch_penalty
         self.eviction_penalty = eviction_penalty
         self.miss_penalty = miss_penalty
@@ -628,106 +716,197 @@ class UnifiedBanditController(UnifiedScoreController):
         self.wasted_prefetch_penalty = wasted_prefetch_penalty
         self.miss_reduction_bonus = miss_reduction_bonus
         self.miss_increase_penalty = miss_increase_penalty
+        self.budget_useful_prefetch_bonus = budget_useful_prefetch_bonus
+        self.budget_wasted_prefetch_penalty = budget_wasted_prefetch_penalty
+        self.budget_miss_reduction_bonus = budget_miss_reduction_bonus
+        self.budget_miss_increase_penalty = budget_miss_increase_penalty
         self.bootstrap_steps = bootstrap_steps
         self.heuristic_prior_bonus = heuristic_prior_bonus
-        self._dim = 12
-        self._A = {action: np.eye(self._dim, dtype=np.float64) for action in self.actions}
-        self._b = {action: np.zeros(self._dim, dtype=np.float64) for action in self.actions}
-        self.last_action: UnifiedAction | None = None
+        self._dim = 18
+        self._trust_A = {profile: np.eye(self._dim, dtype=np.float64) for profile in self.trust_profiles}
+        self._trust_b = {profile: np.zeros(self._dim, dtype=np.float64) for profile in self.trust_profiles}
+        self._budget_A = {profile: np.eye(self._dim, dtype=np.float64) for profile in self.budget_profiles}
+        self._budget_b = {profile: np.zeros(self._dim, dtype=np.float64) for profile in self.budget_profiles}
+        self.last_trust_profile: UnifiedTrustProfile | None = None
+        self.last_budget_profile: UnifiedBudgetProfile | None = None
         self.last_features: np.ndarray | None = None
-        self.last_ucb_scores: dict[UnifiedAction, float] = {}
         self.steps_observed = 0
         self.prev_stall_ms = 0.0
         self.prev_demand_misses = 0.0
         self.prev_evictions = 0.0
-        self.pending_action: UnifiedAction | None = None
+        self.pending_trust_profile: UnifiedTrustProfile | None = None
+        self.pending_budget_profile: UnifiedBudgetProfile | None = None
         self.pending_features: np.ndarray | None = None
         self.pending_prefetched_pages: frozenset[KVPageId] = frozenset()
-        self.action_counts: dict[UnifiedAction, int] = {action: 0 for action in self.actions}
+        self.trust_counts: dict[UnifiedTrustProfile, int] = {profile: 0 for profile in self.trust_profiles}
+        self.budget_counts: dict[UnifiedBudgetProfile, int] = {profile: 0 for profile in self.budget_profiles}
         self.normalized = NormalizedHeadWeightedScorer()
         self.layer_normalized = LayerNormalizedHeadActivityScorer()
         self.page_stats = PageStatsHybridScorer(beta_reuse=0.12, gamma_page_hotness=0.18, delta_tile_hotness=0.05)
 
+    def _nearest_trust_profile(
+        self,
+        normalized_weight: float,
+        layer_weight: float,
+        page_weight: float,
+    ) -> UnifiedTrustProfile:
+        return min(
+            self.trust_profiles,
+            key=lambda profile: (
+                abs(profile.normalized_weight - normalized_weight)
+                + abs(profile.layer_weight - layer_weight)
+                + abs(profile.page_weight - page_weight)
+            ),
+        )
+
+    def _nearest_budget_profile(self, prefetch_k: int, guard_prefetch: bool) -> UnifiedBudgetProfile:
+        return min(
+            self.budget_profiles,
+            key=lambda profile: (
+                abs(profile.prefetch_k - prefetch_k),
+                int(profile.guard_prefetch != guard_prefetch),
+            ),
+        )
+
     def _features(self, context: ControllerContext) -> np.ndarray:
+        avg_tile_hotness = _mean_feature(context, "tile_recent_frequency")
+        avg_request_page_hotness = _mean_feature(context, "request_page_recent_frequency")
+        max_layer_pressure = max(context.per_layer_pressure.values(), default=0.0)
+        mean_layer_pressure = sum(context.per_layer_pressure.values()) / max(1, len(context.per_layer_pressure))
         return np.array(
             [
                 1.0,
                 _predicted_ratio(context),
                 _mean_feature(context, "request_reuse_distance_short"),
                 _mean_feature(context, "request_reuse_distance_inverse"),
+                avg_request_page_hotness,
+                avg_tile_hotness,
                 context.miss_rate,
                 context.transfer_backlog / max(1, context.hbm_capacity_pages),
                 (len(context.resident_pages) + len(context.inflight_pages)) / max(1, context.hbm_capacity_pages),
                 len(context.required_pages) / max(1, context.hbm_capacity_pages),
-                sum(context.per_layer_pressure.values()) / max(1, len(context.per_layer_pressure)),
+                len(context.predicted_pages) / max(1, context.hbm_capacity_pages),
+                max_layer_pressure,
+                mean_layer_pressure,
                 self.prev_stall_ms,
                 self.prev_demand_misses / 100.0,
                 self.prev_evictions / 100.0,
+                context.inflight_transfer_count / max(1, context.hbm_capacity_pages),
+                len(context.queued_transfers) / max(1, context.hbm_capacity_pages),
             ],
             dtype=np.float64,
         )
 
-    def _linucb_score(self, action: UnifiedAction, features: np.ndarray) -> float:
-        A_inv = np.linalg.inv(self._A[action])
-        theta = A_inv @ self._b[action]
-        exploitation = float(theta @ features)
-        exploration = float(self.alpha * math.sqrt(features @ A_inv @ features))
-        return exploitation + exploration
-
-    def _heuristic_action(self, context: ControllerContext) -> UnifiedAction:
+    def _heuristic_profiles(
+        self,
+        context: ControllerContext,
+    ) -> tuple[UnifiedTrustProfile, UnifiedBudgetProfile]:
         predicted_ratio = _predicted_ratio(context)
         short_reuse_fraction = _mean_feature(context, "request_reuse_distance_short")
+        occupancy_ratio = (
+            (len(context.resident_pages) + len(context.inflight_pages)) / max(1, context.hbm_capacity_pages)
+        )
+        if context.transfer_backlog > 0 or occupancy_ratio >= 0.95:
+            return (
+                self._nearest_trust_profile(0.85, 0.15, 0.00),
+                self._nearest_budget_profile(0, True),
+            )
         if predicted_ratio >= 1.0:
-            return UnifiedAction("page_stats", 4)
+            return (
+                self._nearest_trust_profile(0.15, 0.20, 0.65),
+                self._nearest_budget_profile(4, False),
+            )
         if short_reuse_fraction >= 0.05:
-            return UnifiedAction("layer_normalized", 2)
-        return UnifiedAction("normalized", 1)
+            return (
+                self._nearest_trust_profile(0.35, 0.65, 0.00),
+                self._nearest_budget_profile(2, True),
+            )
+        return (
+            self._nearest_trust_profile(0.85, 0.15, 0.00),
+            self._nearest_budget_profile(1, True),
+        )
 
-    def _action_score(self, action: UnifiedAction, features: np.ndarray, heuristic_action: UnifiedAction) -> float:
-        score = self._linucb_score(action, features)
-        if action.scorer_mode == heuristic_action.scorer_mode:
-            score += self.heuristic_prior_bonus
-        if action.prefetch_k == heuristic_action.prefetch_k:
-            score += 0.5 * self.heuristic_prior_bonus
-        return score
+    def _score_profile(
+        self,
+        profile,
+        features: np.ndarray,
+        A_map: dict,
+        b_map: dict,
+        heuristic_profile,
+    ) -> float:
+        raise NotImplementedError
 
-    def _mode_scores(self, mode: str, step: WorkloadStep) -> dict[KVPageId, float]:
-        if mode == "normalized":
-            return self.normalized.score_step(step)
-        if mode == "layer_normalized":
-            return self.layer_normalized.score_step(step)
-        if mode == "page_stats":
-            return self.page_stats.score_step(step)
-        raise ValueError(f"Unknown unified scorer mode: {mode}")
+    def _blend_profile_scores(self, profile: UnifiedTrustProfile, step: WorkloadStep) -> dict[KVPageId, float]:
+        normalized_scores = self.normalized.score_step(step)
+        layer_scores = self.layer_normalized.score_step(step)
+        page_scores = self.page_stats.score_step(step)
+        pages = set(normalized_scores) | set(layer_scores) | set(page_scores)
+        return {
+            page: (
+                profile.normalized_weight * normalized_scores.get(page, 0.0)
+                + profile.layer_weight * layer_scores.get(page, 0.0)
+                + profile.page_weight * page_scores.get(page, 0.0)
+            )
+            for page in pages
+        }
 
-    def effective_scores(self, context: ControllerContext) -> dict[KVPageId, float]:
-        step = _step_from_context(context)
-        features = self._features(context)
-        heuristic_action = self._heuristic_action(context)
+    def _select_profiles(
+        self,
+        context: ControllerContext,
+        features: np.ndarray,
+    ) -> tuple[UnifiedTrustProfile, UnifiedBudgetProfile]:
+        heuristic_trust, heuristic_budget = self._heuristic_profiles(context)
 
         if self.steps_observed < self.bootstrap_steps:
-            chosen = heuristic_action
-            self.last_ucb_scores = {chosen: 0.0}
-        else:
-            ucb_scores = {
-                action: self._action_score(action, features, heuristic_action)
-                for action in self.actions
-            }
-            chosen = max(self.actions, key=lambda action: ucb_scores[action])
-            self.last_ucb_scores = ucb_scores
+            return heuristic_trust, heuristic_budget
 
-        self.last_action = chosen
+        chosen_trust = max(
+            self.trust_profiles,
+            key=lambda profile: self._score_profile(
+                profile, features, self._trust_A, self._trust_b, heuristic_trust
+            ),
+        )
+        chosen_budget = max(
+            self.budget_profiles,
+            key=lambda profile: self._score_profile(
+                profile, features, self._budget_A, self._budget_b, heuristic_budget
+            ),
+        )
+        return chosen_trust, chosen_budget
+
+    def effective_scores(self, context: ControllerContext) -> dict[KVPageId, float]:
+        if self.last_trust_profile is None:
+            return self.normalized.score_step(_step_from_context(context))
+        return self._blend_profile_scores(self.last_trust_profile, _step_from_context(context))
+
+    def decide(self, context: ControllerContext) -> PolicyOutput:
+        features = self._features(context)
+        chosen_trust, chosen_budget = self._select_profiles(context, features)
+        self.last_trust_profile = chosen_trust
+        self.last_budget_profile = chosen_budget
         self.last_features = features
-        self.action_counts[chosen] += 1
-        self.prefetch_k = chosen.prefetch_k
-        return self._mode_scores(chosen.scorer_mode, step)
+        self.trust_counts[chosen_trust] += 1
+        self.budget_counts[chosen_budget] += 1
+
+        step = _step_from_context(context)
+        scores = self._blend_profile_scores(chosen_trust, step)
+        base_prefetch_k = chosen_budget.prefetch_k
+        effective_prefetch_k = (
+            _guarded_prefetch_k(context, base_prefetch_k)
+            if chosen_budget.guard_prefetch
+            else base_prefetch_k
+        )
+        incoming_prefetch = _incoming_prefetch_pages_by_score(context, scores, effective_prefetch_k)
+        need_slots = max(0, len(incoming_prefetch) - _free_slots(context))
+        evict_pages = _lowest_resident_pages_by_scores(context, scores, need_slots)
+        return PolicyOutput(evict_pages=evict_pages, prefetch_pages=tuple(incoming_prefetch))
 
     def observe(self, context: ControllerContext, decision: PolicyOutput, metrics: StepMetrics) -> None:
-        if self.last_action is None or self.last_features is None:
+        if self.last_trust_profile is None or self.last_budget_profile is None or self.last_features is None:
             return
 
-        delayed_reward = -(metrics.stall_ms + self.miss_penalty * metrics.demand_misses)
-        immediate_control_cost = -(
+        base_reward = -(metrics.stall_ms + self.miss_penalty * metrics.demand_misses)
+        control_cost = -(
             self.prefetch_penalty * metrics.prefetch_submitted
             + self.eviction_penalty * metrics.evictions
         )
@@ -736,26 +915,50 @@ class UnifiedBanditController(UnifiedScoreController):
         wasted_prefetches = len(self.pending_prefetched_pages - set(context.required_pages))
         miss_reduction = max(0.0, self.prev_demand_misses - float(metrics.demand_misses))
         miss_increase = max(0.0, float(metrics.demand_misses) - self.prev_demand_misses)
-        delayed_reward += (
+        delayed_bonus = (
             self.useful_prefetch_bonus * useful_prefetches
             - self.wasted_prefetch_penalty * wasted_prefetches
             + self.miss_reduction_bonus * miss_reduction
             - self.miss_increase_penalty * miss_increase
         )
+        trust_reward = base_reward + delayed_bonus
+        budget_reward = (
+            base_reward
+            + control_cost
+            + self.budget_useful_prefetch_bonus * useful_prefetches
+            - self.budget_wasted_prefetch_penalty * wasted_prefetches
+            + self.budget_miss_reduction_bonus * miss_reduction
+            - self.budget_miss_increase_penalty * miss_increase
+        )
 
-        if self.pending_action is not None and self.pending_features is not None:
-            self._A[self.pending_action] = self._A[self.pending_action] + np.outer(
+        if self.pending_trust_profile is not None and self.pending_features is not None:
+            self._trust_A[self.pending_trust_profile] = self._trust_A[self.pending_trust_profile] + np.outer(
                 self.pending_features, self.pending_features
             )
-            self._b[self.pending_action] = self._b[self.pending_action] + delayed_reward * self.pending_features
-        else:
-            self._A[self.last_action] = self._A[self.last_action] + np.outer(self.last_features, self.last_features)
-            self._b[self.last_action] = self._b[self.last_action] + delayed_reward * self.last_features
+            self._trust_b[self.pending_trust_profile] = (
+                self._trust_b[self.pending_trust_profile] + trust_reward * self.pending_features
+            )
+        if self.pending_budget_profile is not None and self.pending_features is not None:
+            self._budget_A[self.pending_budget_profile] = self._budget_A[self.pending_budget_profile] + np.outer(
+                self.pending_features, self.pending_features
+            )
+            self._budget_b[self.pending_budget_profile] = (
+                self._budget_b[self.pending_budget_profile] + budget_reward * self.pending_features
+            )
 
-        self._A[self.last_action] = self._A[self.last_action] + np.outer(self.last_features, self.last_features)
-        self._b[self.last_action] = self._b[self.last_action] + immediate_control_cost * self.last_features
+        self._trust_A[self.last_trust_profile] = self._trust_A[self.last_trust_profile] + np.outer(
+            self.last_features, self.last_features
+        )
+        self._trust_b[self.last_trust_profile] = self._trust_b[self.last_trust_profile] + trust_reward * self.last_features
+        self._budget_A[self.last_budget_profile] = self._budget_A[self.last_budget_profile] + np.outer(
+            self.last_features, self.last_features
+        )
+        self._budget_b[self.last_budget_profile] = (
+            self._budget_b[self.last_budget_profile] + budget_reward * self.last_features
+        )
 
-        self.pending_action = self.last_action
+        self.pending_trust_profile = self.last_trust_profile
+        self.pending_budget_profile = self.last_budget_profile
         self.pending_features = self.last_features
         self.pending_prefetched_pages = frozenset(decision.prefetch_pages)
         self.steps_observed += 1
@@ -766,9 +969,65 @@ class UnifiedBanditController(UnifiedScoreController):
     def diagnostics(self) -> dict[str, object]:
         return {
             "steps_observed": self.steps_observed,
-            "last_action": self.last_action,
-            "action_counts": dict(self.action_counts),
+            "last_trust_profile": self.last_trust_profile,
+            "last_budget_profile": self.last_budget_profile,
+            "trust_counts": dict(self.trust_counts),
+            "budget_counts": dict(self.budget_counts),
         }
+
+
+class UnifiedBanditController(AdaptiveUnifiedControllerBase):
+    """Decoupled LinUCB controller over trust and aggressiveness decisions."""
+
+    def __init__(self, *args, alpha: float = 0.30, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = alpha
+
+    def _score_profile(
+        self,
+        profile,
+        features: np.ndarray,
+        A_map: dict,
+        b_map: dict,
+        heuristic_profile,
+    ) -> float:
+        A_inv = np.linalg.inv(A_map[profile])
+        theta = A_inv @ b_map[profile]
+        exploitation = float(theta @ features)
+        exploration = float(self.alpha * math.sqrt(features @ A_inv @ features))
+        score = exploitation + exploration
+        if profile.name == heuristic_profile.name:
+            score += self.heuristic_prior_bonus
+        return score
+
+
+class UnifiedThompsonController(AdaptiveUnifiedControllerBase):
+    """Decoupled linear Thompson-sampling controller.
+
+    This gives us a second lightweight model family for the unified controller
+    study without introducing a heavy offline-trained model yet.
+    """
+
+    def __init__(self, *args, sample_scale: float = 0.25, seed: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sample_scale = sample_scale
+        self.rng = np.random.default_rng(seed)
+
+    def _score_profile(
+        self,
+        profile,
+        features: np.ndarray,
+        A_map: dict,
+        b_map: dict,
+        heuristic_profile,
+    ) -> float:
+        A_inv = np.linalg.inv(A_map[profile])
+        theta_mean = A_inv @ b_map[profile]
+        sampled_theta = self.rng.multivariate_normal(theta_mean, self.sample_scale * A_inv)
+        score = float(sampled_theta @ features)
+        if profile.name == heuristic_profile.name:
+            score += self.heuristic_prior_bonus
+        return score
 
 
 class FutureTraceOracle:

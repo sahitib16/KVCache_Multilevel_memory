@@ -48,6 +48,7 @@ from kv_controller import (
     UnifiedBanditController,
     UnifiedBlendController,
     UnifiedRuleController,
+    UnifiedThompsonController,
     apply_scorer_to_trace,
     benchmark_policies_across_seeds,
     benchmark_policies,
@@ -181,6 +182,8 @@ def build_controller(policy_name: str, prefetch_k: int, bandit_menu: str = "trim
         return UnifiedBlendController(prefetch_k=prefetch_k)
     if policy_name == "unified_bandit":
         return UnifiedBanditController()
+    if policy_name == "unified_thompson":
+        return UnifiedThompsonController()
     if policy_name == "bandit":
         return ContextualBanditController(actions=build_bandit_action_menu(bandit_menu))
     raise ValueError(f"Unknown policy: {policy_name}")

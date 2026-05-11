@@ -2514,6 +2514,280 @@ Hard benchmark (`round_robin_interleave`, capacity `84`)
 - we do not yet need training data for reuse either
 - the next bottleneck is controller/selector design, not lack of labels
 
+## More-Adaptive Unified Trust-Profile Attempt
+
+### Goal
+
+- remove more hardcoding from the unified adaptive controller
+- stop choosing only discrete scorer labels
+- instead learn how much to trust:
+  - normalized head score
+  - layer-normalized score
+  - page-stats / reuse-aware score
+
+### What Changed
+
+- `UnifiedBanditController` actions now represent trust profiles instead of
+  plain scorer labels
+- each action now chooses:
+  - normalized weight
+  - layer-normalized weight
+  - page-stats weight
+  - prefetch depth
+- the feature vector was expanded with more regime proxies:
+  - predicted ratio
+  - short reuse fraction
+  - request reuse inverse
+  - request-page hotness
+  - tile hotness
+  - occupancy
+  - required pressure
+  - predicted pressure
+  - max/mean layer pressure
+  - previous-step outcome
+  - transfer pressure
+
+### Result
+
+Main benchmark:
+- unified_bandit:
+  - total miss `2181`
+  - mean stall `3.0505`
+  - prefetch `76`
+  - evictions `2233`
+
+Middle benchmark:
+- unified_bandit:
+  - total miss `2150`
+  - mean stall `2.9889`
+  - prefetch `60`
+  - evictions `2186`
+
+Hard benchmark:
+- unified_bandit:
+  - total miss `3120`
+  - mean stall `4.4415`
+  - prefetch `324`
+  - evictions `3366`
+
+### Interpretation
+
+- this attempt made the adaptive unified controller less hardcoded
+- but it did not make it universally better
+- it still helps a lot in the hard regime compared with `score`
+- but it over-prefetches and loses the main/middle advantage
+
+### What We Learned
+
+- removing hardcoding is not enough by itself
+- the adaptive controller now has more freedom, but not enough structure yet
+- the next version should probably learn:
+  - trust profile
+  - and a separate aggressiveness / budget signal
+  rather than coupling both too tightly in one action
+
+## Decoupled Adaptive Unified Controller + Model-Type Comparison
+
+### Goal
+
+- make the unified controller less hardcoded in the right way
+- separate:
+  - scorer trust
+  - aggressiveness / prefetch budget
+- test more than one lightweight model family instead of assuming LinUCB is
+  automatically the best final controller form
+
+### What Changed
+
+- `UnifiedBanditController` was refactored into a decoupled adaptive design
+- it now learns two choices separately:
+  - `UnifiedTrustProfile`
+  - `UnifiedBudgetProfile`
+- trust reward and budget reward are updated separately
+- added `UnifiedThompsonController` as a second lightweight online model family
+  using linear Thompson sampling over the same trust/budget choice structure
+
+### Why This Mattered
+
+- the previous adaptive unified controller still bundled trust and
+  aggressiveness together in one action
+- that made it too easy for the controller to over-prefetch in the easier
+  regimes while chasing hard-regime gains
+- this refactor gets us closer to the actual desired story:
+  one integrated online controller that adapts internal behavior instead of
+  switching between hand-written policies
+
+### Results From `scripts/compare_unified_controllers.py`
+
+Main benchmark (`recent_threshold_round_robin_interleave`, capacity 32):
+- score:
+  - total miss `2181`
+  - mean stall `3.0505`
+- bandit:
+  - total miss `2181`
+  - mean stall `3.0073`
+- unified_bandit (decoupled LinUCB):
+  - total miss `2181`
+  - mean stall `3.0505`
+  - prefetch `60`
+- unified_thompson:
+  - total miss `2181`
+  - mean stall `3.0424`
+  - prefetch `42`
+
+Middle benchmark (`recent_topk_round_robin_interleave`, capacity 24):
+- score:
+  - total miss `2150`
+  - mean stall `2.9889`
+- bandit:
+  - total miss `2150`
+  - mean stall `2.9619`
+- unified_bandit (decoupled LinUCB):
+  - total miss `2150`
+  - mean stall `2.9889`
+  - prefetch `31`
+- unified_thompson:
+  - total miss `2150`
+  - mean stall `2.9889`
+  - prefetch `36`
+
+Hard benchmark (`round_robin_interleave`, capacity 84):
+- score:
+  - total miss `3258`
+  - mean stall `4.6494`
+- bandit:
+  - total miss `3295`
+  - mean stall `4.6035`
+- unified_rule:
+  - total miss `3072`
+  - mean stall `4.3983`
+- unified_bandit (decoupled LinUCB):
+  - total miss `3052`
+  - mean stall `4.3281`
+  - p95 stall `10.8000`
+  - prefetch `392`
+- unified_thompson:
+  - total miss `3287`
+  - mean stall `4.5819`
+  - p95 stall `10.8000`
+
+### Interpretation
+
+- this is the first adaptive unified controller result that clearly beats the
+  rule/blend unified controllers on the hard benchmark
+- decoupling trust from aggressiveness helped exactly where we hoped:
+  the integrated controller can now push hard-regime performance further
+  without needing a hand-written regime switch
+- the cost is that main and middle still are not where we want them
+- Thompson sampling is a valid comparison point, but in this version it is not
+  the best model family; the decoupled LinUCB controller is stronger
+
+### Current Honest Conclusion
+
+- one adaptive unified controller is now genuinely plausible
+- the best current model form is still a lightweight linear contextual bandit
+- the remaining problem is no longer "can one controller work?"
+- it is:
+  - how to preserve hard-regime wins
+  - while recovering the easier-regime efficiency of the older bandit
+
+## Generated Menus + Stricter Budget Learning
+
+### Goal
+
+- remove more hand-picked structure from the adaptive unified controller
+- generate trust and budget action spaces programmatically instead of relying
+  on one short manually written list
+- put more of the controller behavior behind measurable reward terms,
+  especially for the aggressiveness / budget learner
+
+### What Changed
+
+- added `build_default_unified_trust_profiles(...)`
+  - coarse simplex over normalized / layer / page trust
+- added `build_default_unified_budget_profiles(...)`
+  - includes:
+    - true no-prefetch option
+    - guarded and unguarded variants of multiple prefetch depths
+- `AdaptiveUnifiedControllerBase` now uses those generated menus by default
+- budget learning now has its own stricter reward terms:
+  - `budget_useful_prefetch_bonus`
+  - `budget_wasted_prefetch_penalty`
+  - `budget_miss_reduction_bonus`
+  - `budget_miss_increase_penalty`
+
+### Why This Was Worth Trying
+
+- main/middle failure looked like an over-aggressive budget policy
+- the earlier decoupled LinUCB controller still leaned on a compact,
+  hand-crafted action menu
+- this version makes the controller less hand-authored and more benchmarked
+
+### Result From `scripts/compare_unified_controllers.py`
+
+Main benchmark:
+- unified_bandit:
+  - total miss `2182`
+  - mean stall `3.0186`
+  - prefetch `43`
+- unified_thompson:
+  - total miss `2181`
+  - mean stall `3.0289`
+  - prefetch `37`
+
+Middle benchmark:
+- unified_bandit:
+  - total miss `2150`
+  - mean stall `2.9619`
+  - prefetch `32`
+- unified_thompson:
+  - total miss `2150`
+  - mean stall `2.9484`
+  - prefetch `21`
+
+Hard benchmark:
+- unified_bandit:
+  - total miss `3336`
+  - mean stall `4.6332`
+  - prefetch `108`
+- unified_thompson:
+  - total miss `3091`
+  - mean stall `4.3767`
+  - prefetch `353`
+
+### Interpretation
+
+- making the budget learner stricter did help the easier regimes
+  - unified-bandit is now much less over-aggressive on main/middle
+- but it over-corrected for LinUCB in the hard regime
+  - the hard-regime win disappeared for `unified_bandit`
+- the surprise result is that the Thompson-style controller now looks like the
+  best balanced adaptive unified controller:
+  - not best on main
+  - but competitive on main
+  - stronger on middle
+  - much stronger on hard
+
+### What We Learned
+
+- "remove hardcoding" and "make one model win everywhere" are not the same thing
+- generating the action spaces was still the right move:
+  - it reduced arbitrary menu choices
+  - it gave us a more honest model-family comparison
+- once the action spaces became richer and the budget learner became stricter,
+  the better unified model family shifted from LinUCB toward Thompson sampling
+
+### Current Honest Conclusion
+
+- the strongest current unified-controller candidate is now
+  `UnifiedThompsonController`
+- the linear-bandit family is still useful, but it is no longer the only
+  serious option
+- next work should focus on:
+  - benchmark-backed tuning of budget reward terms
+  - and deciding whether Thompson should become the main unified-controller
+    path
+
 ## Adaptive Unified-Controller Update
 
 ### What Was Wrong Before
